@@ -27,7 +27,7 @@ services:
     container_name: bitaxe-bench-web
     restart: unless-stopped
     ports:
-      - "8020:8000"          # host:container
+      - "8000:8000"          # host:container (use whatever port you'd like)
     volumes:
       - bitaxe_bench_data:/app/data
     environment:
