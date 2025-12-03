@@ -1,6 +1,6 @@
 # Bitaxe Hashrate Benchmark - Web GUI
 
-Based on mrv777's Python-based benchmarking tool, this is a dockerized web gui for running tests and reviewing results.
+Based on mrv777's Python-based benchmarking tool, this is a dockerized web gui for running tests and reviewing results. I used ChatGPT for lots of this but have also worked on double-checking and tweaking things, so please let me know if there are any issues. Use at your own discretion.
 
 ## Features
 
