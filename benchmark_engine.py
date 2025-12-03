@@ -1,0 +1,1089 @@
+# benchmark_engine.py
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, fields
+from enum import Enum
+from typing import Optional, List, Dict, Any, Callable
+import threading
+import time
+import json
+import os
+from datetime import datetime
+
+import requests
+
+
+class DeviceType(str, Enum):
+    GAMMA_602 = "gamma_602"
+    NERDQAXE_PP = "nerdqaxe_pp"
+    OTHER = "other"
+
+
+@dataclass
+class BenchmarkConfig:
+    device_type: DeviceType
+    initial_voltage: int = 1150
+    initial_frequency: int = 500
+
+    max_temp: int = 66
+    max_vr_temp: int = 86
+    max_allowed_voltage: int = 1400
+    min_allowed_voltage: int = 1000
+    max_allowed_frequency: int = 1200
+    min_allowed_frequency: int = 400
+    max_power: int = 40
+    min_input_voltage: int = 4800
+    max_input_voltage: int = 5500
+
+    benchmark_time: int = 600
+    sample_interval: int = 15
+    sleep_time: int = 90
+    min_samples: int = 7
+    voltage_increment: int = 20
+    frequency_increment: int = 25
+    
+    # New: optional error-rate threshold (%). If None, we fall back to 2.0.
+    error_rate_warn_threshold: Optional[float] = None
+
+
+# Built-in safe-ish overrides per device type
+BUILTIN_PROFILE_OVERRIDES: Dict[DeviceType, Dict[str, Any]] = {
+    DeviceType.GAMMA_602: {
+        "max_power": 40,
+        "max_temp": 66,
+        "max_vr_temp": 86,
+    },
+    DeviceType.NERDQAXE_PP: {
+        # Adjust as you learn NerdQaxe++ behavior
+        "max_power": 115,
+        "max_temp": 70,
+        "max_vr_temp": 90,
+    },
+    DeviceType.OTHER: {},
+}
+
+
+def make_builtin_config(device_type: DeviceType) -> BenchmarkConfig:
+    overrides = BUILTIN_PROFILE_OVERRIDES.get(device_type, {})
+    return BenchmarkConfig(device_type=device_type, **overrides)
+
+
+def identify_device(bitaxe_ip: str, timeout: float = 5.0) -> Dict[str, Any]:
+    """
+    Query /api/system/info and /api/system/asic to:
+      - auto-identify device type (Gamma vs NerdQaxe++ vs Other)
+      - provide a suggested config
+      - return device metadata and current starting conditions
+    """
+    base = bitaxe_ip.strip()
+    if not base.startswith("http://") and not base.startswith("https://"):
+        base = "http://" + base
+
+    system_info: Dict[str, Any] = {}
+    asic_info: Dict[str, Any] = {}
+
+    # /api/system/info
+    try:
+        r = requests.get(f"{base}/api/system/info", timeout=timeout)
+        r.raise_for_status()
+        system_info = r.json()
+    except Exception:
+        system_info = {}
+
+    # /api/system/asic
+    try:
+        r2 = requests.get(f"{base}/api/system/asic", timeout=timeout)
+        r2.raise_for_status()
+        asic_info = r2.json()
+    except Exception:
+        asic_info = {}
+
+    # Build a combined label string from known fields to classify device
+    labels: List[str] = []
+    for src in (asic_info, system_info):
+        if not isinstance(src, dict):
+            continue
+        for key in (
+            "deviceModel",
+            "boardVersion",
+            "model",
+            "deviceName",
+            "boardName",
+            "ASICModel",
+        ):
+            val = src.get(key)
+            if isinstance(val, str):
+                labels.append(val.lower())
+
+    label_str = " ".join(labels)
+
+    dtype: DeviceType = DeviceType.OTHER
+    if "nerdqaxe" in label_str:
+        dtype = DeviceType.NERDQAXE_PP
+    elif "gamma" in label_str or "bitaxe" in label_str or "602" in label_str:
+        dtype = DeviceType.GAMMA_602
+    else:
+        # fallback heuristic: multi-ASIC devices are more likely NerdQaxe++
+        asic_count = None
+        if isinstance(asic_info, dict):
+            asic_count = asic_info.get("asicCount")
+        if asic_count is None and isinstance(system_info, dict):
+            asic_count = system_info.get("asicCount")
+        try:
+            if asic_count and int(asic_count) >= 4:
+                dtype = DeviceType.NERDQAXE_PP
+        except Exception:
+            pass
+
+    builtin_cfg = make_builtin_config(dtype)
+
+    # Determine starting/default voltage & frequency from device
+    start_v = None
+    start_f = None
+    # Prefer current live settings from /info
+    if isinstance(system_info, dict):
+        start_v = system_info.get("coreVoltage")
+        start_f = system_info.get("frequency")
+    # Fallback to default values from /asic
+    if start_v is None and isinstance(asic_info, dict):
+        start_v = asic_info.get("defaultVoltage")
+    if start_f is None and isinstance(asic_info, dict):
+        start_f = asic_info.get("defaultFrequency")
+
+    cfg_dict = asdict(builtin_cfg)
+    if isinstance(start_v, (int, float)):
+        cfg_dict["initial_voltage"] = int(start_v)
+    if isinstance(start_f, (int, float)):
+        cfg_dict["initial_frequency"] = int(start_f)
+
+    # Device metadata to show in UI / notes
+    device_meta = {
+        "asicModel": (
+            (isinstance(asic_info, dict) and asic_info.get("ASICModel"))
+            or (isinstance(system_info, dict) and system_info.get("ASICModel"))
+        ),
+        "deviceModel": (isinstance(asic_info, dict) and asic_info.get("deviceModel")) or None,
+        "boardVersion": isinstance(system_info, dict) and system_info.get("boardVersion"),
+        "asicCount": (
+            (isinstance(asic_info, dict) and asic_info.get("asicCount"))
+            or (isinstance(system_info, dict) and system_info.get("asicCount"))
+        ),
+        "smallCoreCount": isinstance(system_info, dict) and system_info.get("smallCoreCount"),
+        "firmwareVersion": isinstance(system_info, dict) and system_info.get("version"),
+        "axeOSVersion": isinstance(system_info, dict) and system_info.get("axeOSVersion"),
+        "hostname": isinstance(system_info, dict) and system_info.get("hostname"),
+    }
+
+    # Starting / current runtime readings from /info
+    starting = {}
+    if isinstance(system_info, dict):
+        for key in (
+            "coreVoltage",
+            "coreVoltageActual",
+            "frequency",
+            "temp",
+            "temp2",
+            "vrTemp",
+            "power",
+            "voltage",
+            "hashRate",
+            "expectedHashrate",
+            "fanspeed",
+            "fanrpm",
+            "temptarget",
+            "errorPercentage",
+        ):
+            if key in system_info:
+                starting[key] = system_info[key]
+
+    return {
+        "deviceType": dtype.value,
+        "config": cfg_dict,
+        "deviceInfo": device_meta,
+        "starting": starting,
+        "rawInfo": {"systemInfo": system_info, "asicInfo": asic_info},
+    }
+
+
+class BenchmarkStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class BenchmarkRunner:
+    """
+    Encapsulates a single benchmark run against one device.
+    Designed to be run in a background thread so the web API stays responsive.
+    """
+
+    def __init__(
+        self,
+        run_id: str,
+        bitaxe_ip: str,
+        config: BenchmarkConfig,
+        on_finish: Optional[Callable[["BenchmarkRunner", Optional[str]], None]] = None,
+    ):
+        self.run_id = run_id
+        self.bitaxe_ip_raw = bitaxe_ip.strip()
+        if self.bitaxe_ip_raw.startswith("http://") or self.bitaxe_ip_raw.startswith("https://"):
+            self.base_url = self.bitaxe_ip_raw
+        else:
+            self.base_url = f"http://{self.bitaxe_ip_raw}"
+
+        self.config = config
+        self.on_finish = on_finish
+
+        self.status: BenchmarkStatus = BenchmarkStatus.PENDING
+        # Global progress 0–100 for the whole run
+        self.progress: float = 0.0
+        self.current_voltage: int = config.initial_voltage
+        self.current_frequency: int = config.initial_frequency
+        self.results: List[Dict[str, Any]] = []
+        self.last_sample: Optional[Dict[str, Any]] = None
+        self.error_reason: Optional[str] = None
+
+        # info discovered from device
+        self.default_voltage: Optional[int] = None
+        self.default_frequency: Optional[int] = None
+        self.small_core_count: Optional[int] = None
+        self.asic_count: Optional[int] = None
+
+        self.best_hashrate: Optional[float] = None
+        self.best_efficiency: Optional[float] = None
+
+        self.start_time: Optional[str] = None
+        self.end_time: Optional[str] = None
+
+        # ETA-related
+        self.eta_seconds: Optional[float] = None
+        self._start_dt: Optional[datetime] = None
+        self._approx_total_iterations: int = 1
+        self._iteration_index: int = 0
+
+        # Narrative + recent point history
+        self.status_detail: Optional[str] = None
+
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    # --- public API ---
+
+    def start(self) -> None:
+        if self._thread:
+            raise RuntimeError("Benchmark already started")
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def to_dict(self, include_results: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            data: Dict[str, Any] = {
+                "runId": self.run_id,
+                "bitaxeIp": self.bitaxe_ip_raw,
+                "status": self.status.value,
+                "progress": self.progress,
+                "currentVoltage": self.current_voltage,
+                "currentFrequency": self.current_frequency,
+                "deviceType": self.config.device_type.value,
+                "startTime": self.start_time,
+                "endTime": self.end_time,
+                "errorReason": self.error_reason,
+                "bestHashrate": self.best_hashrate,
+                "bestEfficiency": self.best_efficiency,
+                "lastSample": self.last_sample,
+                "config": asdict(self.config),
+                "etaSeconds": self.eta_seconds,
+                "statusDetail": self.status_detail,
+                # last 10 completed test points
+                "recentResults": self.results[-10:] if self.results else [],
+            }
+            if include_results:
+                data["results"] = self.results
+            return data
+
+    # --- ETA helpers ---
+
+    def _estimate_total_iterations(self) -> int:
+        cfg = self.config
+        if cfg.frequency_increment <= 0 or cfg.voltage_increment <= 0:
+            return 1
+        vol_steps = max(
+            1, (cfg.max_allowed_voltage - cfg.initial_voltage) // cfg.voltage_increment + 1
+        )
+        freq_steps = max(
+            1, (cfg.max_allowed_frequency - cfg.initial_frequency) // cfg.frequency_increment + 1
+        )
+        est = vol_steps * freq_steps
+        return max(1, min(est, 128))  # cap so ETAs don't explode for huge ranges
+
+    def _update_eta(self, iteration_index: int, sample_index: int, total_samples: int) -> None:
+        """
+        Also updates global progress based on iteration + intra-iteration position.
+        """
+        if not self._start_dt:
+            return
+        elapsed = (datetime.utcnow() - self._start_dt).total_seconds()
+        if elapsed <= 0:
+            return
+
+        frac_iter = iteration_index + (sample_index / max(1, total_samples))
+        overall_fraction = frac_iter / max(1, self._approx_total_iterations)
+        if overall_fraction <= 0:
+            return
+
+        total_est = elapsed / overall_fraction
+        self.eta_seconds = max(0.0, total_est - elapsed)
+        # Global progress 0–100
+        self.progress = max(0.0, min(100.0, overall_fraction * 100.0))
+
+    # --- narrative helpers ---
+
+    def _describe_error_reason(self, code: str) -> str:
+        mapping = {
+            "CANCELLED": "cancelled by request",
+            "SYSTEM_INFO_FAILURE": "unable to read /api/system/info from device",
+            "MISSING_TEMP_OR_VOLTAGE": "missing temperature or input voltage readings",
+            "TEMPERATURE_BELOW_5": "chip temperature reading below 5°C (sensor/boot issue)",
+            "CHIP_TEMP_EXCEEDED": "chip temperature exceeded configured max",
+            "VR_TEMP_EXCEEDED": "VR temperature exceeded configured max",
+            "INPUT_VOLTAGE_BELOW_MIN": "input voltage dropped below configured minimum",
+            "INPUT_VOLTAGE_ABOVE_MAX": "input voltage exceeded configured maximum",
+            "MISSING_HASHRATE_OR_POWER": "missing hashrate or power readings",
+            "POWER_CONSUMPTION_EXCEEDED": "power consumption above configured limit",
+            "NO_DATA_COLLECTED": "no valid samples collected",
+            "ZERO_HASHRATE": "average hashrate was zero",
+        }
+        return mapping.get(code, code.replace("_", " ").lower())
+
+    def _build_status_detail(
+        self,
+        iteration_index: int,
+        current_voltage: int,
+        current_frequency: int,
+        prev_hashrate_ok: Optional[bool],
+        prev_error_reason: Optional[str],
+        prev_avg_hashrate: Optional[float],
+        prev_avg_temp: Optional[float],
+        prev_efficiency: Optional[float],
+    ) -> str:
+        cfg = self.config
+        total_iters = self._approx_total_iterations
+        iter_label = f"step {iteration_index + 1} of ~{total_iters}"
+
+        # Why this step?
+        if iteration_index == 0:
+            reason = "starting baseline sweep from initial profile"
+        elif prev_error_reason:
+            reason = (
+                f"previous run stopped due to {self._describe_error_reason(prev_error_reason)}; "
+                "this is the next safe point in the sweep"
+            )
+        elif prev_hashrate_ok is True:
+            reason = (
+                "previous run passed thermal and hashrate checks; "
+                f"increasing frequency by +{cfg.frequency_increment} MHz"
+            )
+        elif prev_hashrate_ok is False:
+            reason = (
+                "previous run's hashrate was below expected; "
+                f"raising core voltage by +{cfg.voltage_increment} mV and backing off frequency"
+            )
+        else:
+            reason = "continuing sweep based on previous measurements"
+
+        if prev_avg_hashrate is not None and prev_avg_temp is not None and prev_efficiency is not None:
+            reason += (
+                f" (last point: {prev_avg_hashrate:.1f} GH/s, "
+                f"{prev_avg_temp:.1f} °C, {prev_efficiency:.2f} J/TH)"
+            )
+
+        # What’s next (if stable)?
+        next_if_stable_freq = None
+        if current_frequency + cfg.frequency_increment <= cfg.max_allowed_frequency:
+            next_if_stable_freq = current_frequency + cfg.frequency_increment
+
+        if next_if_stable_freq is not None:
+            next_clause = (
+                f"next target {next_if_stable_freq} MHz @ {current_voltage} mV if stable"
+            )
+        else:
+            # At max freq; further steps would be voltage-driven or we're done
+            next_clause = "this is near the configured limit; will stop or adjust voltage after this point"
+
+        return (
+            f"Testing {current_frequency} MHz @ {current_voltage} mV "
+            f"({iter_label}) — {reason}. {next_clause}."
+        )
+
+    # --- main run loop ---
+
+    def _run(self) -> None:
+        self.start_time = datetime.utcnow().isoformat()
+        self._start_dt = datetime.utcnow()
+        self.status = BenchmarkStatus.RUNNING
+        result_path: Optional[str] = None
+
+        prev_hashrate_ok: Optional[bool] = None
+        prev_error_reason: Optional[str] = None
+        prev_avg_hashrate: Optional[float] = None
+        prev_avg_temp: Optional[float] = None
+        prev_efficiency: Optional[float] = None
+
+        try:
+            self._validate_config()
+            self._fetch_default_settings()
+
+            self._approx_total_iterations = self._estimate_total_iterations()
+            iteration_index = 0
+
+            current_voltage = self.config.initial_voltage
+            current_frequency = self.config.initial_frequency
+
+            while (
+                current_voltage <= self.config.max_allowed_voltage
+                and current_frequency <= self.config.max_allowed_frequency
+            ):
+                if self._stop.is_set():
+                    self.status = BenchmarkStatus.CANCELLED
+                    self.error_reason = "Cancelled by user"
+                    with self._lock:
+                        self.status_detail = (
+                            "Benchmark cancelled by user; cleaning up and restoring device settings."
+                        )
+                    break
+
+                # Update current V/F and narrative before this iteration
+                self.current_voltage = current_voltage
+                self.current_frequency = current_frequency
+
+                with self._lock:
+                    self.status_detail = self._build_status_detail(
+                        iteration_index=iteration_index,
+                        current_voltage=current_voltage,
+                        current_frequency=current_frequency,
+                        prev_hashrate_ok=prev_hashrate_ok,
+                        prev_error_reason=prev_error_reason,
+                        prev_avg_hashrate=prev_avg_hashrate,
+                        prev_avg_temp=prev_avg_temp,
+                        prev_efficiency=prev_efficiency,
+                    )
+
+                self._set_system_settings(current_voltage, current_frequency)
+
+                # expose current iteration index for ETA updates
+                self._iteration_index = iteration_index
+
+                (
+                    avg_hashrate,
+                    avg_temp,
+                    efficiency_jth,
+                    hashrate_ok,
+                    avg_vr_temp,
+                    error_reason,
+                    extras,
+                ) = self._benchmark_iteration(current_voltage, current_frequency)
+
+                iteration_index += 1
+
+                prev_hashrate_ok = hashrate_ok
+                prev_error_reason = error_reason
+                prev_avg_hashrate = avg_hashrate
+                prev_avg_temp = avg_temp
+                prev_efficiency = efficiency_jth
+
+                if self._stop.is_set():
+                    self.status = BenchmarkStatus.CANCELLED
+                    self.error_reason = "Cancelled by user"
+                    with self._lock:
+                        self.status_detail = (
+                            "Benchmark cancelled by user; cleaning up and restoring device settings."
+                        )
+                    break
+
+                if error_reason is not None:
+                    # hit some thermal/power/safety limit
+                    self.error_reason = error_reason
+                    with self._lock:
+                        self.status_detail = (
+                            f"Stopping benchmark: {self._describe_error_reason(error_reason)}."
+                        )
+                    break
+
+                if (
+                    avg_hashrate is not None
+                    and avg_temp is not None
+                    and efficiency_jth is not None
+                ):
+                    avg_power = extras.get("avgPower") if extras else None
+                    avg_fan_pct = extras.get("avgFanPct") if extras else None
+                    avg_fan_rpm = extras.get("avgFanRpm") if extras else None
+                    hashrate_domains = extras.get("hashrateDomains") if extras else None
+                    avg_err_pct = extras.get("avgErrorPercentage") if extras else None
+
+                    result: Dict[str, Any] = {
+                        "coreVoltage": current_voltage,
+                        "frequency": current_frequency,
+                        "averageHashRate": avg_hashrate,
+                        "averageTemperature": avg_temp,
+                        "efficiencyJTH": efficiency_jth,
+                    }
+                    if avg_power is not None:
+                        result["averagePower"] = avg_power
+                    if avg_vr_temp is not None:
+                        result["averageVRTemp"] = avg_vr_temp
+                    if avg_fan_pct is not None:
+                        result["fanSpeed"] = avg_fan_pct     # picked up by UI as fanSpeed/fan_pct/fanspeed
+                    if avg_fan_rpm is not None:
+                        result["fanRPM"] = avg_fan_rpm       # picked up by UI as fanRPM/fan_rpm/fanrpm
+                    if avg_err_pct is not None:
+                        result["errorPercentage"] = avg_err_pct
+                    if hashrate_domains is not None:
+                        # full per-ASIC / per-domain stats
+                        result["hashrateDomains"] = hashrate_domains
+
+                    self.results.append(result)
+
+                    # update bests
+                    if self.best_hashrate is None or avg_hashrate > self.best_hashrate:
+                        self.best_hashrate = avg_hashrate
+                    if self.best_efficiency is None or efficiency_jth < self.best_efficiency:
+                        self.best_efficiency = efficiency_jth
+
+                    # same decision logic as original script
+                    if hashrate_ok:
+                        # If hashrate is good, try increasing frequency
+                        if (
+                            current_frequency + self.config.frequency_increment
+                            <= self.config.max_allowed_frequency
+                        ):
+                            current_frequency += self.config.frequency_increment
+                        else:
+                            # can't increase further; we're done
+                            with self._lock:
+                                self.status_detail = (
+                                    "Benchmark completed: reached maximum configured frequency "
+                                    "with acceptable hashrate and thermals."
+                                )
+                            break
+                    else:
+                        # If hashrate is not good, go back one frequency step and increase voltage
+                        if (
+                            current_voltage + self.config.voltage_increment
+                            <= self.config.max_allowed_voltage
+                        ):
+                            current_voltage += self.config.voltage_increment
+                            current_frequency -= self.config.frequency_increment
+                            if current_frequency < self.config.min_allowed_frequency:
+                                current_frequency = self.config.min_allowed_frequency
+                        else:
+                            with self._lock:
+                                self.status_detail = (
+                                    "Benchmark stopping: voltage ceiling reached with suboptimal "
+                                    "hashrate; not pushing further."
+                                )
+                            break
+                else:
+                    # no data / zero hashrate etc – stop
+                    with self._lock:
+                        self.status_detail = (
+                            "Benchmark stopping: no valid data collected at this point."
+                        )
+                    break
+
+            # After loop finishes, reset device
+            self._reset_to_best_or_default()
+            if self.results:
+                result_path = self._write_results_json()
+                if self.status != BenchmarkStatus.CANCELLED:
+                    self.status = BenchmarkStatus.COMPLETED
+                    with self._lock:
+                        if not self.status_detail:
+                            self.status_detail = (
+                                "Benchmark completed; restored device to best-performing settings."
+                            )
+            else:
+                if self.status != BenchmarkStatus.CANCELLED:
+                    self.status = BenchmarkStatus.FAILED
+                    if self.error_reason is None:
+                        self.error_reason = "No valid benchmarking results"
+                    with self._lock:
+                        self.status_detail = (
+                            f"Benchmark failed: {self._describe_error_reason(self.error_reason)}."
+                        )
+
+        except Exception as e:
+            self.status = BenchmarkStatus.FAILED
+            self.error_reason = f"Unexpected error: {e}"
+            with self._lock:
+                self.status_detail = f"Benchmark failed due to unexpected error: {e}."
+            try:
+                self._reset_to_best_or_default()
+            except Exception:
+                pass
+        finally:
+            self.end_time = datetime.utcnow().isoformat()
+            if self.on_finish:
+                try:
+                    self.on_finish(self, result_path)
+                except Exception:
+                    pass
+
+    # --- helpers: config & device talking ---
+
+    def _validate_config(self) -> None:
+        cfg = self.config
+        if cfg.initial_voltage > cfg.max_allowed_voltage:
+            raise ValueError(
+                f"Initial voltage {cfg.initial_voltage} exceeds max allowed {cfg.max_allowed_voltage}"
+            )
+        if cfg.initial_voltage < cfg.min_allowed_voltage:
+            raise ValueError(
+                f"Initial voltage {cfg.initial_voltage} below min allowed {cfg.min_allowed_voltage}"
+            )
+        if cfg.initial_frequency > cfg.max_allowed_frequency:
+            raise ValueError(
+                f"Initial frequency {cfg.initial_frequency} exceeds max allowed {cfg.max_allowed_frequency}"
+            )
+        if cfg.initial_frequency < cfg.min_allowed_frequency:
+            raise ValueError(
+                f"Initial frequency {cfg.initial_frequency} below min allowed {cfg.min_allowed_frequency}"
+            )
+        if cfg.benchmark_time / cfg.sample_interval < cfg.min_samples:
+            raise ValueError(
+                "Benchmark time too short vs sample interval; not enough samples"
+            )
+
+    def _fetch_default_settings(self) -> None:
+        """
+        Get small_core_count, asic_count, and reasonable default voltage/frequency.
+        Does NOT hard-fail if smallCoreCount is missing.
+        """
+        # /api/system/info
+        url_info = f"{self.base_url}/api/system/info"
+        r = requests.get(url_info, timeout=10)
+        r.raise_for_status()
+        system_info = r.json()
+
+        self.small_core_count = system_info.get("smallCoreCount")
+        self.asic_count = system_info.get("asicCount")
+
+        self.default_voltage = system_info.get("coreVoltage", 1150)
+        self.default_frequency = system_info.get("frequency", 500)
+
+        # /api/system/asic (optional but helpful)
+        url_asic = f"{self.base_url}/api/system/asic"
+        try:
+            r2 = requests.get(url_asic, timeout=10)
+            r2.raise_for_status()
+            asic_info = r2.json()
+        except Exception:
+            asic_info = {}
+
+        if isinstance(asic_info, dict):
+            self.default_voltage = asic_info.get("defaultVoltage", self.default_voltage)
+            self.default_frequency = asic_info.get(
+                "defaultFrequency", self.default_frequency
+            )
+            if self.asic_count is None:
+                self.asic_count = asic_info.get("asicCount", self.asic_count)
+
+    def _get_system_info(self) -> Optional[Dict[str, Any]]:
+        retries = 3
+        for _ in range(retries):
+            try:
+                r = requests.get(f"{self.base_url}/api/system/info", timeout=10)
+                r.raise_for_status()
+                return r.json()
+            except requests.exceptions.RequestException:
+                time.sleep(5)
+        return None
+
+    def _set_system_settings(self, core_voltage: int, frequency: int) -> None:
+        payload = {
+            "coreVoltage": core_voltage,
+            "frequency": frequency,
+        }
+        r = requests.patch(f"{self.base_url}/api/system", json=payload, timeout=10)
+        r.raise_for_status()
+        # restart + wait for stabilization
+        self._restart_system(wait=self.config.sleep_time)
+
+    def _restart_system(self, wait: int = 0) -> None:
+        r = requests.post(f"{self.base_url}/api/system/restart", timeout=10)
+        r.raise_for_status()
+        if wait > 0:
+            time.sleep(wait)
+
+    # --- core benchmark iteration ---
+
+    def _benchmark_iteration(
+        self, core_voltage: int, frequency: int
+    ) -> tuple[
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        bool,
+        Optional[float],
+        Optional[str],
+        Optional[Dict[str, Any]],
+    ]:
+        """
+        Returns:
+          average_hashrate, average_temp, efficiency_jth, hashrate_ok,
+          avg_vr_temp, error_reason, extras
+        """
+        cfg = self.config
+        hash_rates: List[float] = []
+        temps: List[float] = []
+        powers: List[float] = []
+        vr_temps: List[float] = []
+        fan_pcts: List[float] = []
+        fan_rpms: List[float] = []
+        error_pcts: List[float] = []
+
+        # hashrateMonitor domain tracking:
+        # domains_samples[asic_index][domain_index] = [samples...]
+        domains_samples: List[List[List[float]]] = []
+        # per-ASIC total hashrate samples (hashrateMonitor.asics[*].total)
+        asic_total_samples: List[List[float]] = []
+        # per-ASIC errorCount start/end
+        asic_error_start: List[Optional[int]] = []
+        asic_error_end: List[Optional[int]] = []
+
+        extras: Dict[str, Any] = {}
+
+        total_samples = cfg.benchmark_time // cfg.sample_interval
+
+        expected_from_cores: Optional[float] = None
+        if self.small_core_count and self.asic_count:
+            try:
+                expected_from_cores = frequency * (
+                    (self.small_core_count * self.asic_count) / 1000.0
+                )
+            except Exception:
+                expected_from_cores = None
+
+        expected_hashrate: Optional[float] = None  # from API if available
+
+        for i in range(total_samples):
+            if self._stop.is_set():
+                return None, None, None, False, None, "CANCELLED", None
+
+            info = self._get_system_info()
+            if info is None:
+                return None, None, None, False, None, "SYSTEM_INFO_FAILURE", None
+
+            # Grab firmware's own expectedHashrate if not yet set
+            if expected_hashrate is None:
+                maybe_exp = info.get("expectedHashrate")
+                if isinstance(maybe_exp, (int, float)) and maybe_exp > 0:
+                    expected_hashrate = float(maybe_exp)
+
+            temp = info.get("temp")
+            vr_temp = info.get("vrTemp")
+            voltage = info.get("voltage")
+            hash_rate = info.get("hashRate")
+            power = info.get("power")
+            fanspeed = info.get("fanspeed")          # bitaxe field
+            fanrpm = info.get("fanrpm")              # bitaxe field
+            error_percentage = info.get("errorPercentage")
+            hashrate_monitor = info.get("hashrateMonitor")
+
+            if temp is None or voltage is None:
+                return None, None, None, False, None, "MISSING_TEMP_OR_VOLTAGE", None
+
+            if temp < 5:
+                return None, None, None, False, None, "TEMPERATURE_BELOW_5", None
+
+            if temp >= cfg.max_temp:
+                return None, None, None, False, None, "CHIP_TEMP_EXCEEDED", None
+
+            if vr_temp is not None and vr_temp >= cfg.max_vr_temp:
+                return None, None, None, False, None, "VR_TEMP_EXCEEDED", None
+
+            if voltage < cfg.min_input_voltage:
+                return None, None, None, False, None, "INPUT_VOLTAGE_BELOW_MIN", None
+
+            if voltage > cfg.max_input_voltage:
+                return None, None, None, False, None, "INPUT_VOLTAGE_ABOVE_MAX", None
+
+            if hash_rate is None or power is None:
+                return None, None, None, False, None, "MISSING_HASHRATE_OR_POWER", None
+
+            if power > cfg.max_power:
+                return None, None, None, False, None, "POWER_CONSUMPTION_EXCEEDED", None
+
+            hash_rates.append(float(hash_rate))
+            temps.append(float(temp))
+            powers.append(float(power))
+            if vr_temp is not None and vr_temp > 0:
+                vr_temps.append(float(vr_temp))
+            if isinstance(fanspeed, (int, float)):
+                fan_pcts.append(float(fanspeed))
+            if isinstance(fanrpm, (int, float)):
+                fan_rpms.append(float(fanrpm))
+            if isinstance(error_percentage, (int, float)):
+                error_pcts.append(float(error_percentage))
+
+            # hashrate registers tracking (Gamma + Nerdqaxe++). Graceful if missing.
+            if isinstance(hashrate_monitor, dict):
+                asics = hashrate_monitor.get("asics")
+                if isinstance(asics, list):
+                    for asic_index, asic_entry in enumerate(asics):
+                        if not isinstance(asic_entry, dict):
+                            continue
+
+                        # ensure per-ASIC arrays exist
+                        while len(domains_samples) <= asic_index:
+                            domains_samples.append([])
+                        while len(asic_total_samples) <= asic_index:
+                            asic_total_samples.append([])
+                        while len(asic_error_start) <= asic_index:
+                            asic_error_start.append(None)
+                        while len(asic_error_end) <= asic_index:
+                            asic_error_end.append(None)
+
+                        # total hashrate per ASIC (optional but useful)
+                        maybe_total = asic_entry.get("total")
+                        if isinstance(maybe_total, (int, float)):
+                            asic_total_samples[asic_index].append(float(maybe_total))
+
+                        # errorCount per ASIC (we track start/end + delta)
+                        maybe_ec = asic_entry.get("errorCount")
+                        if isinstance(maybe_ec, (int, float)):
+                            ec_int = int(maybe_ec)
+                            if asic_error_start[asic_index] is None:
+                                asic_error_start[asic_index] = ec_int
+                            asic_error_end[asic_index] = ec_int
+
+                        # per-domain hashrate registers
+                        domains = asic_entry.get("domains")
+                        if isinstance(domains, list):
+                            # ensure per-domain lists
+                            while len(domains_samples[asic_index]) < len(domains):
+                                domains_samples[asic_index].append([])
+                            for domain_index, val in enumerate(domains):
+                                if isinstance(val, (int, float)):
+                                    domains_samples[asic_index][domain_index].append(float(val))
+
+            with self._lock:
+                # last_sample is per-iteration; progress is global (updated via _update_eta)
+                self.last_sample = {
+                    "sample": i + 1,
+                    "totalSamples": total_samples,
+                    "hashRate": hash_rate,
+                    "temp": temp,
+                    "vrTemp": vr_temp,
+                    "voltage": voltage,
+                    "power": power,
+                    "fanspeed": fanspeed,
+                    "fanrpm": fanrpm,
+                    "errorPercentage": error_percentage,
+                }
+                # update ETA + global progress using current iteration + sample index
+                self._update_eta(self._iteration_index, i + 1, total_samples)
+
+            if i < total_samples - 1:
+                time.sleep(cfg.sample_interval)
+
+        if not hash_rates or not temps or not powers:
+            return None, None, None, False, None, "NO_DATA_COLLECTED", None
+
+        # Trim outliers for hashrate: drop 3 highest + 3 lowest if enough samples
+        sorted_hash = sorted(hash_rates)
+        trimmed_hash = (
+            sorted_hash[3:-3] if len(sorted_hash) > 6 else sorted_hash
+        )
+        avg_hash = sum(trimmed_hash) / len(trimmed_hash) if trimmed_hash else 0.0
+
+        # Remove first 6 temps (warmup) if possible
+        sorted_temp = sorted(temps)
+        trimmed_temp = sorted_temp[6:] if len(sorted_temp) > 6 else sorted_temp
+        avg_temp = sum(trimmed_temp) / len(trimmed_temp) if trimmed_temp else 0.0
+
+        avg_vr_temp = None
+        if vr_temps:
+            sorted_vr = sorted(vr_temps)
+            trimmed_vr = sorted_vr[6:] if len(sorted_vr) > 6 else sorted_vr
+            if trimmed_vr:
+                avg_vr_temp = sum(trimmed_vr) / len(trimmed_vr)
+
+        avg_power = sum(powers) / len(powers)
+        avg_fan_pct: Optional[float] = None
+        if fan_pcts:
+            avg_fan_pct = sum(fan_pcts) / len(fan_pcts)
+        avg_fan_rpm: Optional[float] = None
+        if fan_rpms:
+            avg_fan_rpm = sum(fan_rpms) / len(fan_rpms)
+        avg_error_pct: Optional[float] = None
+        if error_pcts:
+            avg_error_pct = sum(error_pcts) / len(error_pcts)
+
+        if avg_hash <= 0:
+            return None, None, None, False, avg_vr_temp, "ZERO_HASHRATE", None
+
+        efficiency_jth = avg_power / (avg_hash / 1000.0)
+
+        # choose best guess for expected hashrate:
+        # prefer firmware's expectedHashrate, fallback to core-count math
+        if expected_hashrate is None:
+            expected_hashrate = expected_from_cores
+
+        if expected_hashrate is not None and expected_hashrate > 0:
+            hashrate_ok = (avg_hash >= expected_hashrate * 0.94)
+        else:
+            # no idea what "expected" is; don't penalize
+            hashrate_ok = True
+            
+        # --- Fold ASIC error % into "is this point good?" (configurable) ---
+        threshold = self.config.error_rate_warn_threshold
+        if threshold is None:
+            threshold = 2.0  # default if not set in config / UI
+
+        if avg_error_pct is not None and avg_error_pct > threshold:
+            # Treat this point as "not good enough", which will cause the
+            # outer loop to raise V / back off F and re-test.
+            hashrate_ok = False
+
+        # --- build hashrate domain statistics (min/max/avg/stddev per domain) ---
+        hashrate_domains_stats: List[Dict[str, Any]] = []
+        for asic_index, asic_domains in enumerate(domains_samples):
+            if not isinstance(asic_domains, list):
+                continue
+
+            domain_stats_list: List[Dict[str, Any]] = []
+            for domain_index, samples in enumerate(asic_domains):
+                if not samples:
+                    continue
+                mn = min(samples)
+                mx = max(samples)
+                avg = sum(samples) / len(samples)
+                # population stddev
+                var = sum((x - avg) ** 2 for x in samples) / len(samples)
+                stddev = var ** 0.5
+
+                domain_stats_list.append(
+                    {
+                        "index": domain_index,
+                        "min": mn,
+                        "max": mx,
+                        "avg": avg,
+                        "stddev": stddev,
+                    }
+                )
+
+            if not domain_stats_list and not (asic_total_samples and asic_total_samples[asic_index]) \
+               and (asic_error_start[asic_index] is None and asic_error_end[asic_index] is None):
+                continue
+
+            asic_entry: Dict[str, Any] = {
+                "asicIndex": asic_index,
+                "domains": domain_stats_list,
+            }
+
+            if asic_index < len(asic_total_samples) and asic_total_samples[asic_index]:
+                totals = asic_total_samples[asic_index]
+                asic_entry["avgTotal"] = sum(totals) / len(totals)
+
+            if asic_index < len(asic_error_start):
+                ec_start = asic_error_start[asic_index]
+                ec_end = asic_error_end[asic_index]
+                if ec_start is not None:
+                    asic_entry["errorCountStart"] = ec_start
+                if ec_end is not None:
+                    asic_entry["errorCountEnd"] = ec_end
+                    if ec_start is not None:
+                        asic_entry["errorCountDelta"] = ec_end - ec_start
+
+            hashrate_domains_stats.append(asic_entry)
+
+        # populate extras dict
+        extras["avgPower"] = avg_power
+        if avg_fan_pct is not None:
+            extras["avgFanPct"] = avg_fan_pct
+        if avg_fan_rpm is not None:
+            extras["avgFanRpm"] = avg_fan_rpm
+        if avg_error_pct is not None:
+            extras["avgErrorPercentage"] = avg_error_pct
+        if hashrate_domains_stats:
+            extras["hashrateDomains"] = hashrate_domains_stats
+        # Optional: record what threshold was used for this run
+        extras["errorRateWarnThreshold"] = threshold
+
+        return avg_hash, avg_temp, efficiency_jth, hashrate_ok, avg_vr_temp, None, (extras or None)
+
+    # --- cleanup & results writing ---
+
+    def _reset_to_best_or_default(self) -> None:
+        if self.default_voltage is None or self.default_frequency is None:
+            return
+
+        if self.results:
+            best = sorted(
+                self.results,
+                key=lambda x: x["averageHashRate"],
+                reverse=True,
+            )[0]
+            v = best["coreVoltage"]
+            f = best["frequency"]
+        else:
+            v = self.default_voltage
+            f = self.default_frequency
+
+        self._set_system_settings(v, f)
+
+    def _write_results_json(self) -> str:
+        """
+        Writes full results JSON (all results + top performers) to /data/results.
+        Returns the file path.
+        """
+        start = self.start_time or datetime.utcnow().isoformat()
+        start_ts = start.replace(":", "").replace("-", "")
+        filename = f"run_{self.run_id}_{self.bitaxe_ip_raw.replace('.', '-')}_{start_ts}.json"
+
+        base_dir = os.path.join("data", "results")
+        os.makedirs(base_dir, exist_ok=True)
+        path = os.path.join(base_dir, filename)
+
+        top_by_hash = sorted(
+            self.results, key=lambda x: x["averageHashRate"], reverse=True
+        )[:5]
+        top_by_eff = sorted(
+            self.results, key=lambda x: x["efficiencyJTH"]
+        )[:5]
+
+        final_data = {
+            "runId": self.run_id,
+            "bitaxeIp": self.bitaxe_ip_raw,
+            "deviceType": self.config.device_type.value,
+            "startTime": self.start_time,
+            "endTime": self.end_time,
+            "config": asdict(self.config),
+            "results": self.results,
+            "topPerformers": top_by_hash,
+            "mostEfficient": top_by_eff,
+        }
+
+        with open(path, "w") as f:
+            json.dump(final_data, f, indent=2)
+
+        return path
+
+
+def config_from_dict(data: Dict[str, Any]) -> BenchmarkConfig:
+    """
+    Helper to construct BenchmarkConfig from arbitrary dict (e.g. from API).
+    """
+    field_names = {f.name for f in fields(BenchmarkConfig)}
+    filtered = {k: v for k, v in data.items() if k in field_names}
+    # convert device_type if needed
+    dt = filtered.get("device_type") or filtered.get("deviceType")
+    if not isinstance(dt, DeviceType):
+        filtered["device_type"] = DeviceType(dt)
+    return BenchmarkConfig(**filtered)

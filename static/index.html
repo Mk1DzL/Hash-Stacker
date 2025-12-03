@@ -1,0 +1,1019 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <title>Bitaxe / NerdQaxe Benchmark</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #050711;
+      --fg: #f9fafb;
+      --muted: #94a3b8;
+      --accent: #22c55e;
+      --danger: #ef4444;
+      --card: #0b1120;
+      --border: #1f2937;
+      --table-stripe: #020617;
+    }
+    [data-theme="light"] {
+      --bg: #f9fafb;
+      --fg: #020617;
+      --muted: #6b7280;
+      --accent: #16a34a;
+      --danger: #b91c1c;
+      --card: #ffffff;
+      --border: #e5e7eb;
+      --table-stripe: #f3f4f6;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+      background: radial-gradient(circle at top left, #111827 0, var(--bg) 40%);
+      color: var(--fg);
+    }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    .page {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1rem 1rem 3rem;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    header h1 {
+      font-size: 1.4rem;
+      margin: 0;
+    }
+    .sub {
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    .card {
+      background: color-mix(in srgb, var(--card) 92%, transparent);
+      border-radius: 16px;
+      padding: 1rem 1.2rem;
+      border: 1px solid var(--border);
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.45);
+      margin-bottom: 1rem;
+    }
+    .card-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.75rem;
+    }
+    .card-title h2 {
+      font-size: 1rem;
+      margin: 0;
+    }
+    .pill {
+      font-size: 0.75rem;
+      border-radius: 999px;
+      padding: 0.2rem 0.6rem;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 0.75rem 1rem;
+    }
+    label {
+      font-size: 0.8rem;
+      display: block;
+      margin-bottom: 0.25rem;
+      color: var(--muted);
+    }
+    input[type="text"],
+    input[type="number"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 0.4rem 0.5rem;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg) 85%, var(--card) 15%);
+      color: var(--fg);
+      font-size: 0.85rem;
+    }
+    textarea {
+      resize: vertical;
+      min-height: 60px;
+    }
+    input:focus,
+    select:focus,
+    textarea:focus {
+      outline: 1px solid var(--accent);
+      border-color: var(--accent);
+    }
+    .row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 0.4rem;
+    }
+    .row > * {
+      flex: 1;
+    }
+    .row > .shrink {
+      flex: 0 0 auto;
+    }
+    .btn {
+      padding: 0.4rem 0.8rem;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 0.85rem;
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+    .btn.secondary {
+      background: transparent;
+      border-color: var(--border);
+      color: var(--fg);
+    }
+    .btn.danger {
+      background: var(--danger);
+      color: white;
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .divider {
+      height: 1px;
+      background: var(--border);
+      margin: 0.5rem 0 0.75rem;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.7rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .badge.running {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .badge.failed,
+    .badge.cancelled {
+      border-color: var(--danger);
+      color: var(--danger);
+    }
+    .progress {
+      width: 100%;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.25);
+      overflow: hidden;
+    }
+    .progress-inner {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent), #0ea5e9);
+      transition: width 0.3s ease;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+    th,
+    td {
+      padding: 0.35rem 0.4rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      font-weight: 500;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    tbody tr:nth-child(odd) {
+      background: color-mix(in srgb, var(--table-stripe) 50%, transparent);
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    .muted {
+      color: var(--muted);
+    }
+    .chip {
+      font-size: 0.75rem;
+      padding: 0.1rem 0.45rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      display: inline-flex;
+      gap: 0.3rem;
+      align-items: center;
+    }
+    .chip-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: var(--accent);
+    }
+    .status-detail {
+      cursor: pointer;
+    }
+    .status-detail-panel {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.45rem;
+      background: color-mix(in srgb, var(--card) 90%, transparent);
+    }
+    .status-detail-panel table {
+      font-size: 0.7rem;
+    }
+
+    @media (max-width: 768px) {
+      header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .card {
+        padding: 0.9rem 0.8rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div>
+        <h1>Bitaxe / NerdQaxe Benchmark</h1>
+        <div class="sub">Auto-detect, profile-based stress testing for Bitaxe Gamma 602 & NerdQaxe++</div>
+      </div>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="btn secondary shrink" id="themeToggle">Toggle theme</button>
+      </div>
+    </header>
+
+    <!-- New benchmark card -->
+    <section class="card">
+      <div class="card-title">
+        <h2>Start new benchmark</h2>
+        <span class="pill">Auto-detect, tweak, save as profile, then run</span>
+      </div>
+
+      <div class="row">
+        <div class="shrink" style="min-width:220px;">
+          <label for="ipInput">Target IP</label>
+          <input id="ipInput" type="text" placeholder="192.168.x.x" />
+        </div>
+        <div class="shrink" style="min-width:210px;">
+          <label>Device type</label>
+          <select id="deviceSelect"></select>
+        </div>
+        <div class="shrink" style="min-width:220px;">
+          <label>Profile</label>
+          <select id="profileSelect"></select>
+        </div>
+        <div class="shrink" style="min-width:200px;">
+          <label>&nbsp;</label>
+          <button class="btn secondary" id="detectBtn">Auto-detect &amp; load profile</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label class="switch">
+          <input type="checkbox" id="autoProfileToggle" checked />
+          <span>Auto-select profile based on device</span>
+        </label>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="grid-2" id="configGrid">
+        <!-- Config fields injected by JS -->
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="row">
+        <div>
+          <label for="notesInput">Notes</label>
+          <textarea id="notesInput" placeholder="e.g. Stock fan, 25°C ambient, before repasting..."></textarea>
+        </div>
+        <div style="flex:0.9;">
+          <label for="profileNameInput">Save current config as new profile (optional)</label>
+          <div class="row">
+            <input id="profileNameInput" type="text" placeholder="Quiet Gamma 602" />
+            <button class="btn secondary shrink" id="saveProfileBtn">Save profile</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="justify-content:flex-end;margin-top:0.5rem;">
+        <button class="btn" id="startBtn">Start benchmark</button>
+      </div>
+    </section>
+
+    <!-- Connected device info -->
+    <section class="card" id="deviceInfoCard" style="display:none;">
+      <div class="card-title">
+        <h2>Connected device</h2>
+        <span class="pill" id="deviceInfoHost">–</span>
+      </div>
+      <div id="deviceInfoSummary" class="muted" style="font-size:0.85rem;margin-bottom:0.5rem;"></div>
+      <div class="grid-2" id="deviceInfoDetails"></div>
+    </section>
+
+    <!-- Running jobs -->
+    <section class="card">
+      <div class="card-title">
+        <h2>Running benchmarks</h2>
+        <span class="pill" id="runningSummary">–</span>
+      </div>
+      <div id="runningContainer" class="muted" style="font-size:0.85rem;">
+        No active benchmarks.
+      </div>
+    </section>
+
+    <!-- Past jobs -->
+    <section class="card">
+      <div class="card-title">
+        <h2>Past benchmarks</h2>
+        <span class="pill">Browse, re-run, save configs as profiles</span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table id="runsTable">
+          <thead>
+            <tr>
+              <th>Run ID</th>
+              <th>Device</th>
+              <th>IP</th>
+              <th>Status</th>
+              <th>Best GH/s</th>
+              <th>Best J/TH</th>
+              <th>Started</th>
+              <th>Finished</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="runsBody">
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:0.5rem;font-size:0.8rem;">
+        Click “Load config” to pull a previous run's parameters into the form above.
+      </p>
+    </section>
+  </div>
+
+  <script>
+    const root = document.documentElement;
+    const apiBase = ""; // same origin
+
+    const ipInput = document.getElementById("ipInput");
+    const deviceSelect = document.getElementById("deviceSelect");
+    const profileSelect = document.getElementById("profileSelect");
+    const detectBtn = document.getElementById("detectBtn");
+    const autoProfileToggle = document.getElementById("autoProfileToggle");
+    const configGrid = document.getElementById("configGrid");
+    const notesInput = document.getElementById("notesInput");
+    const profileNameInput = document.getElementById("profileNameInput");
+    const saveProfileBtn = document.getElementById("saveProfileBtn");
+    const startBtn = document.getElementById("startBtn");
+    const runningContainer = document.getElementById("runningContainer");
+    const runningSummary = document.getElementById("runningSummary");
+    const runsBody = document.getElementById("runsBody");
+    const themeToggle = document.getElementById("themeToggle");
+
+    const deviceInfoCard = document.getElementById("deviceInfoCard");
+    const deviceInfoHost = document.getElementById("deviceInfoHost");
+    const deviceInfoSummary = document.getElementById("deviceInfoSummary");
+    const deviceInfoDetails = document.getElementById("deviceInfoDetails");
+
+    const CONFIG_FIELDS = [
+      ["initial_voltage", "Initial voltage (mV)"],
+      ["initial_frequency", "Initial frequency (MHz)"],
+      ["max_temp", "Max chip temperature (°C)"],
+      ["max_vr_temp", "Max VR temperature (°C)"],
+      ["max_allowed_voltage", "Max allowed core voltage (mV)"],
+      ["min_allowed_voltage", "Min allowed core voltage (mV)"],
+      ["max_allowed_frequency", "Max allowed frequency (MHz)"],
+      ["min_allowed_frequency", "Min allowed frequency (MHz)"],
+      ["max_power", "Max power (W)"],
+      ["min_input_voltage", "Min input voltage (mV)"],
+      ["max_input_voltage", "Max input voltage (mV)"],
+      ["benchmark_time", "Benchmark duration (s)"],
+      ["sample_interval", "Sample interval (s)"],
+      ["sleep_time", "Sleep before run (s)"],
+      ["min_samples", "Min required samples"],
+      ["voltage_increment", "Voltage increment (mV)"],
+      ["frequency_increment", "Frequency increment (MHz)"],
+    ];
+
+    let allProfiles = [];
+    let currentConfig = null;
+    let lastDeviceMeta = null;
+    let lastDeviceStarting = null;
+
+    function escapeHtml(str) {
+      if (str == null) return "";
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function setTheme(theme) {
+      root.setAttribute("data-theme", theme);
+      localStorage.setItem("bb_theme", theme);
+    }
+
+    themeToggle.addEventListener("click", () => {
+      const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      setTheme(next);
+    });
+
+    setTheme(localStorage.getItem("bb_theme") || "dark");
+
+    function renderConfigGrid(config) {
+      currentConfig = config;
+      configGrid.innerHTML = "";
+      CONFIG_FIELDS.forEach(([key, label]) => {
+        const val = config[key] ?? "";
+        const wrapper = document.createElement("div");
+        const id = "cfg_" + key;
+        wrapper.innerHTML = `
+          <label for="${id}">${label}</label>
+          <input id="${id}" type="number" step="1" value="${val}" />
+        `;
+        configGrid.appendChild(wrapper);
+      });
+    }
+
+    function readConfigFromInputs(deviceType) {
+      const cfg = {
+        device_type: deviceType,
+      };
+      CONFIG_FIELDS.forEach(([key]) => {
+        const el = document.getElementById("cfg_" + key);
+        if (!el) return;
+        const val = el.value === "" ? null : Number(el.value);
+        cfg[key] = val;
+      });
+      return cfg;
+    }
+
+    function populateDeviceSelect() {
+      const options = [
+        { value: "gamma_602", label: "Bitaxe Gamma 602" },
+        { value: "nerdqaxe_pp", label: "NerdQaxe++" },
+        { value: "other", label: "Other / generic" },
+      ];
+      deviceSelect.innerHTML = "";
+      options.forEach((o) => {
+        const opt = document.createElement("option");
+        opt.value = o.value;
+        opt.textContent = o.label;
+        deviceSelect.appendChild(opt);
+      });
+    }
+
+    function populateProfileSelect() {
+      profileSelect.innerHTML = "";
+      allProfiles.forEach((p) => {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = `${p.name}${p.builtin ? " (builtin)" : ""}`;
+        profileSelect.appendChild(opt);
+      });
+    }
+
+    function getProfileById(id) {
+      return allProfiles.find((p) => p.id === id) || null;
+    }
+
+    async function refreshProfiles() {
+      const res = await fetch(`${apiBase}/api/profiles`);
+      const data = await res.json();
+      allProfiles = data.profiles || [];
+      populateProfileSelect();
+
+      const gamma = allProfiles.find((p) => p.id === "builtin:gamma_602") || allProfiles[0];
+      if (gamma) {
+        deviceSelect.value = gamma.deviceType;
+        profileSelect.value = gamma.id;
+        renderConfigGrid(gamma.config);
+      }
+    }
+
+    profileSelect.addEventListener("change", () => {
+      const p = getProfileById(profileSelect.value);
+      if (!p) return;
+      deviceSelect.value = p.deviceType;
+      renderConfigGrid(p.config);
+    });
+
+    autoProfileToggle.addEventListener("change", () => {
+      const auto = autoProfileToggle.checked;
+      detectBtn.disabled = !auto;
+      profileSelect.disabled = auto;
+    });
+
+    function renderDeviceInfo(meta, starting) {
+      if (!meta) {
+        deviceInfoCard.style.display = "none";
+        return;
+      }
+      lastDeviceMeta = meta;
+      lastDeviceStarting = starting || {};
+
+      const ip = ipInput.value.trim() || "unknown";
+      deviceInfoHost.textContent = ip;
+
+      const asicModel = meta.asicModel || "?";
+      const devModel = meta.deviceModel || "?";
+      const boardVer = meta.boardVersion || "?";
+      const asicCount = meta.asicCount != null ? meta.asicCount : "?";
+      const smallCore = meta.smallCoreCount != null ? meta.smallCoreCount : "?";
+      const fw = meta.firmwareVersion || "?";
+      const axe = meta.axeOSVersion || "?";
+      const host = meta.hostname || "?";
+
+      deviceInfoSummary.textContent =
+        `ASIC ${asicModel} • Model ${devModel} (board ${boardVer}) • ` +
+        `${asicCount} ASIC(s) • ${smallCore} small cores • FW ${fw} / AxeOS ${axe} • Host ${host}`;
+
+      const sv = starting.coreVoltage ?? starting.coreVoltageActual;
+      const sf = starting.frequency;
+      const st = starting.temp;
+      const sp = starting.power;
+      const sh = starting.hashRate;
+      const sexp = starting.expectedHashrate;
+
+      deviceInfoDetails.innerHTML = `
+        <div>
+          <label>Starting V/F</label>
+          <div class="muted" style="font-size:0.85rem;">
+            ${sv != null ? `${sv} mV` : "?"} @ ${sf != null ? `${sf} MHz` : "?"}
+          </div>
+        </div>
+        <div>
+          <label>Starting thermal / power</label>
+          <div class="muted" style="font-size:0.85rem;">
+            Temp: ${st != null ? `${st.toFixed ? st.toFixed(1) : st} °C` : "?"}<br/>
+            Power: ${sp != null ? `${sp.toFixed ? sp.toFixed(1) : sp} W` : "?"}
+          </div>
+        </div>
+        <div>
+          <label>Starting hashrate</label>
+          <div class="muted" style="font-size:0.85rem;">
+            Hashrate: ${sh != null ? `${sh.toFixed ? sh.toFixed(1) : sh} GH/s` : "?"}<br/>
+            Expected: ${sexp != null ? `${sexp} GH/s` : "?"}
+          </div>
+        </div>
+        <div>
+          <label>Fan / cooling</label>
+          <div class="muted" style="font-size:0.85rem;">
+            Fan: ${starting.fanspeed != null ? `${starting.fanspeed}%` : "?"}, ` +
+            `RPM: ${starting.fanrpm != null ? starting.fanrpm : "?"}<br/>
+            Temp target: ${starting.temptarget != null ? `${starting.temptarget} °C` : "?"}
+          </div>
+        </div>
+      `;
+
+      deviceInfoCard.style.display = "block";
+    }
+
+    function maybeStampNotes(meta, starting) {
+      if (!meta) return;
+      const ip = ipInput.value.trim();
+      const lines = [];
+
+      const asicModel = meta.asicModel || "?";
+      const devModel = meta.deviceModel || "?";
+      const boardVer = meta.boardVersion || "?";
+      const asicCount = meta.asicCount != null ? meta.asicCount : "?";
+      const smallCore = meta.smallCoreCount != null ? meta.smallCoreCount : "?";
+      const fw = meta.firmwareVersion || "?";
+      const axe = meta.axeOSVersion || "?";
+      const host = meta.hostname || "?";
+
+      lines.push(`Device: ${devModel} (${asicModel}, board ${boardVer})`);
+      lines.push(`ASICs: ${asicCount}, small cores: ${smallCore}`);
+      lines.push(`Host: ${host} @ ${ip}`);
+      lines.push(`FW: ${fw}, AxeOS: ${axe}`);
+
+      const sv = starting.coreVoltage ?? starting.coreVoltageActual;
+      const sf = starting.frequency;
+      const st = starting.temp;
+      const sp = starting.power;
+      const sh = starting.hashRate;
+      const sexp = starting.expectedHashrate;
+
+      lines.push(
+        `Starting: ${sv != null ? sv : "?"} mV @ ${sf != null ? sf : "?"} MHz, ` +
+        `Hashrate: ${sh != null ? (sh.toFixed ? sh.toFixed(1) : sh) : "?"} GH/s, ` +
+        `Expected: ${sexp != null ? sexp : "?"} GH/s, ` +
+        `Temp: ${st != null ? (st.toFixed ? st.toFixed(1) : st) : "?"} °C, ` +
+        `Power: ${sp != null ? (sp.toFixed ? sp.toFixed(1) : sp) : "?"} W`
+      );
+
+      const stamp = lines.join("\n");
+      const current = notesInput.value || "";
+      if (!current.includes("Device:")) {
+        notesInput.value = stamp + (current ? "\n\n" + current : "");
+      }
+    }
+
+    detectBtn.addEventListener("click", async () => {
+      const ip = ipInput.value.trim();
+      if (!ip) {
+        alert("Please enter a target IP first.");
+        return;
+      }
+      detectBtn.disabled = true;
+      detectBtn.textContent = "Detecting…";
+      try {
+        const res = await fetch(`${apiBase}/api/devices/identify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bitaxe_ip: ip }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+
+        const dtype = data.deviceType;
+        deviceSelect.value = dtype;
+
+        const builtin = allProfiles.find(
+          (p) => p.builtin && p.deviceType === dtype
+        );
+        let cfg = builtin ? builtin.config : data.config || {};
+        renderConfigGrid(cfg);
+
+        if (data.config) {
+          const icfg = data.config;
+          if (icfg.initial_voltage != null) {
+            const el = document.getElementById("cfg_initial_voltage");
+            if (el) el.value = icfg.initial_voltage;
+          }
+          if (icfg.initial_frequency != null) {
+            const el = document.getElementById("cfg_initial_frequency");
+            if (el) el.value = icfg.initial_frequency;
+          }
+        }
+
+        renderDeviceInfo(data.deviceInfo || null, data.starting || {});
+        maybeStampNotes(data.deviceInfo || null, data.starting || {});
+      } catch (err) {
+        console.error(err);
+        alert("Auto-detect failed. Check IP and device firmware.");
+      } finally {
+        detectBtn.disabled = false;
+        detectBtn.textContent = "Auto-detect & load profile";
+      }
+    });
+
+    saveProfileBtn.addEventListener("click", async () => {
+      const name = profileNameInput.value.trim();
+      if (!name) {
+        alert("Enter a name to save this config as a profile.");
+        return;
+      }
+      const deviceType = deviceSelect.value;
+      const cfg = readConfigFromInputs(deviceType);
+      saveProfileBtn.disabled = true;
+      try {
+        const res = await fetch(`${apiBase}/api/profiles`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            device_type: deviceType,
+            deviceType,
+            config: cfg,
+          }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        profileNameInput.value = "";
+        await refreshProfiles();
+        alert("Profile saved.");
+      } catch (err) {
+        console.error(err);
+        alert("Failed to save profile.");
+      } finally {
+        saveProfileBtn.disabled = false;
+      }
+    });
+
+    startBtn.addEventListener("click", async () => {
+      const ip = ipInput.value.trim();
+      if (!ip) {
+        alert("Please enter a target IP.");
+        return;
+      }
+      const deviceType = deviceSelect.value;
+      const cfg = readConfigFromInputs(deviceType);
+      const notes = notesInput.value;
+      const profileName = (getProfileById(profileSelect.value) || {}).name || null;
+
+      startBtn.disabled = true;
+      startBtn.textContent = "Starting…";
+      try {
+        const payload = {
+          bitaxe_ip: ip,
+          device_type: deviceType,
+          notes,
+          profile_name: profileName,
+          ...cfg,
+        };
+        const res = await fetch(`${apiBase}/api/benchmarks`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          let msg = "Failed to start benchmark. See console/logs.";
+          try {
+            const errText = await res.text();
+            msg = errText || msg;
+          } catch (_) {}
+          throw new Error(msg);
+        }
+        const data = await res.json();
+        console.log("Started run", data.runId);
+        await refreshRuns();
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Failed to start benchmark. See console/logs.");
+      } finally {
+        startBtn.disabled = false;
+        startBtn.textContent = "Start benchmark";
+      }
+    });
+
+    function renderRecentPointsTable(points) {
+      if (!points || !points.length) {
+        return `<div class="muted">No completed points yet for this run.</div>`;
+      }
+      const rows = points
+        .map((p) => {
+          const v = p.coreVoltage != null ? p.coreVoltage : "?";
+          const f = p.frequency != null ? p.frequency : "?";
+          const hr = p.averageHashRate != null ? Number(p.averageHashRate).toFixed(1) : "–";
+          const t = p.averageTemperature != null ? Number(p.averageTemperature).toFixed(1) : "–";
+          const vr = p.averageVRTemp != null ? Number(p.averageVRTemp).toFixed(1) : "–";
+          const eff = p.efficiencyJTH != null ? Number(p.efficiencyJTH).toFixed(2) : "–";
+          return `
+            <tr>
+              <td>${v}</td>
+              <td>${f}</td>
+              <td>${hr}</td>
+              <td>${t}</td>
+              <td>${vr}</td>
+              <td>${eff}</td>
+            </tr>
+          `;
+        })
+        .join("");
+      return `
+        <table>
+          <thead>
+            <tr>
+              <th>mV</th>
+              <th>MHz</th>
+              <th>GH/s</th>
+              <th>°C</th>
+              <th>VR °C</th>
+              <th>J/TH</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows}
+          </tbody>
+        </table>
+      `;
+    }
+
+    async function refreshRuns() {
+      const res = await fetch(`${apiBase}/api/benchmarks`);
+      const data = await res.json();
+      const runs = data.runs || [];
+
+      const active = runs.filter((r) =>
+        ["running", "pending"].includes((r.status || "").toLowerCase())
+      );
+      if (!active.length) {
+        runningContainer.textContent = "No active benchmarks.";
+        runningSummary.textContent = "0 active";
+      } else {
+        runningSummary.textContent = `${active.length} active`;
+        runningContainer.innerHTML = "";
+        active.forEach((r) => {
+          const div = document.createElement("div");
+          div.style.marginBottom = "0.6rem";
+          const status = (r.status || "").toLowerCase();
+          const badgeClass =
+            status === "running"
+              ? "badge running"
+              : status === "failed" || status === "cancelled"
+              ? "badge failed"
+              : "badge";
+          const progress = r.progress != null ? Number(r.progress) : 0;
+          const etaSec = r.eta_seconds != null ? Number(r.eta_seconds) : null;
+          let etaText = "";
+          if (etaSec != null && isFinite(etaSec)) {
+            const mins = Math.max(0, etaSec / 60);
+            etaText = ` • ETA ~${mins.toFixed(1)} min`;
+          }
+
+          const statusDetail = (r.status_detail || r.statusDetail || "").trim();
+          const recentResults = r.recent_results || r.recentResults || [];
+
+          const narrativeHtml = statusDetail
+            ? `
+              <div class="muted status-detail" data-run="${r.id}" style="font-size:0.75rem;margin-top:0.15rem;">
+                ${escapeHtml(statusDetail)} <span style="opacity:0.7;">(click to toggle recent points)</span>
+              </div>
+              <div class="status-detail-panel" data-panel="${r.id}" style="display:none;margin-top:0.25rem;font-size:0.7rem;"></div>
+            `
+            : "";
+
+          div.innerHTML = `
+            <div class="row" style="align-items:center;">
+              <div style="flex:1;min-width:180px;">
+                <div class="row" style="margin-bottom:0.25rem;">
+                  <div class="mono" style="font-size:0.75rem;">${r.id}</div>
+                  <span class="${badgeClass}">${r.status}</span>
+                </div>
+                <div class="muted" style="font-size:0.8rem;">
+                  ${r.device_type} @ ${r.bitaxe_ip}
+                  • best: ${r.best_hashrate != null ? Number(r.best_hashrate).toFixed(1) : "–"} GH/s
+                  • eff: ${r.best_efficiency != null ? Number(r.best_efficiency).toFixed(2) : "–"} J/TH
+                </div>
+              </div>
+              <div style="flex:1;min-width:220px;">
+                <div class="progress">
+                  <div class="progress-inner" style="width:${progress.toFixed(1)}%;"></div>
+                </div>
+                <div class="muted" style="font-size:0.7rem;margin-top:0.1rem;">
+                  Progress: ${progress.toFixed(1)}%${etaText}
+                </div>
+                ${narrativeHtml}
+              </div>
+              <div class="shrink">
+                <button class="btn danger shrink" data-cancel="${r.id}">Cancel</button>
+              </div>
+            </div>
+          `;
+
+          runningContainer.appendChild(div);
+
+          div.querySelectorAll("[data-cancel]").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+              const id = btn.getAttribute("data-cancel");
+              if (!confirm(`Cancel benchmark ${id}?`)) return;
+              await fetch(`${apiBase}/api/benchmarks/${id}/cancel`, { method: "POST" });
+              setTimeout(refreshRuns, 500);
+            });
+          });
+
+          const panel = div.querySelector(`.status-detail-panel[data-panel="${r.id}"]`);
+          if (panel) {
+            panel.innerHTML = renderRecentPointsTable(recentResults || []);
+            const label = div.querySelector(`.status-detail[data-run="${r.id}"]`);
+            if (label) {
+              label.addEventListener("click", () => {
+                panel.style.display = panel.style.display === "none" ? "block" : "none";
+              });
+            }
+          }
+        });
+      }
+
+      runsBody.innerHTML = "";
+      runs.forEach((r) => {
+        const tr = document.createElement("tr");
+        const status = (r.status || "").toLowerCase();
+        const badgeClass =
+          status === "running"
+            ? "badge running"
+            : status === "failed" || status === "cancelled"
+            ? "badge failed"
+            : "badge";
+
+        const canDelete = ["failed", "cancelled", "completed"].includes(status);
+
+        const deleteBtnHtml = canDelete
+          ? `<button class="btn danger" data-delete="${r.id}" style="margin-left:0.25rem;">Delete</button>`
+          : "";
+
+        tr.innerHTML = `
+          <td class="mono">${r.id}</td>
+          <td>${r.device_type}</td>
+          <td class="mono">${r.bitaxe_ip}</td>
+          <td><span class="${badgeClass}">${r.status}</span></td>
+          <td>${r.best_hashrate != null ? Number(r.best_hashrate).toFixed(1) : "–"}</td>
+          <td>${r.best_efficiency != null ? Number(r.best_efficiency).toFixed(2) : "–"}</td>
+          <td><span class="muted">${(r.started_at || "").split(".")[0]}</span></td>
+          <td><span class="muted">${(r.finished_at || "").split(".")[0]}</span></td>
+          <td>
+            <button class="btn secondary" data-load="${r.id}" style="margin-right:0.25rem;">Load config</button>
+            <button class="btn secondary" data-details="${r.id}">Details</button>
+            ${deleteBtnHtml}
+          </td>
+        `;
+        runsBody.appendChild(tr);
+      });
+
+      runsBody.querySelectorAll("[data-load]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const id = btn.getAttribute("data-load");
+          const res = await fetch(`${apiBase}/api/benchmarks/${id}?include_results=false`);
+          if (!res.ok) {
+            alert("Failed to load run details.");
+            return;
+          }
+          const data = await res.json();
+          let cfg;
+          if (data.config_json) {
+            cfg = JSON.parse(data.config_json);
+          } else if (data.config) {
+            cfg = typeof data.config === "string" ? JSON.parse(data.config) : data.config;
+          } else {
+            alert("Run did not store config.");
+            return;
+          }
+          const deviceType = cfg.device_type || cfg.deviceType || data.device_type;
+          deviceSelect.value = deviceType;
+          renderConfigGrid(cfg);
+          ipInput.value = data.bitaxe_ip;
+          notesInput.value = data.notes || "";
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        });
+      });
+
+      // NEW: navigate to details page instead of showing JSON inline
+      runsBody.querySelectorAll("[data-details]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-details");
+          // relative path so it works when served from the same static folder
+          window.location.href = `details.html?run=${encodeURIComponent(id)}`;
+        });
+      });
+
+      runsBody.querySelectorAll("[data-delete]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const id = btn.getAttribute("data-delete");
+          if (!confirm(`Delete benchmark ${id}? This will remove it from history.`)) return;
+          const res = await fetch(`${apiBase}/api/benchmarks/${id}`, {
+            method: "DELETE",
+          });
+          if (!res.ok) {
+            let msg = "Failed to delete benchmark.";
+            try {
+              const txt = await res.text();
+              msg = txt || msg;
+            } catch (_) {}
+            alert(msg);
+            return;
+          }
+          await refreshRuns();
+        });
+      });
+    }
+
+    (async () => {
+      populateDeviceSelect();
+      await refreshProfiles();
+      await refreshRuns();
+      setInterval(refreshRuns, 5000);
+    })();
+  </script>
+</body>
+</html>
