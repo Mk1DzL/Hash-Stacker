@@ -1,6 +1,6 @@
-# Bitaxe Hashrate Benchmark
+# Bitaxe Hashrate Benchmark - Web GUI
 
-A Python-based benchmarking tool for optimizing Bitaxe mining performance by testing different voltage and frequency combinations while monitoring hashrate, temperature, and power efficiency.
+Based on mrv777's Python-based benchmarking tool, this is a dockerized web gui for running tests and reviewing results.
 
 ## Features
 
@@ -9,77 +9,34 @@ A Python-based benchmarking tool for optimizing Bitaxe mining performance by tes
 - Power efficiency calculations (J/TH)
 - Automatic saving of benchmark results
 - Graceful shutdown with best settings retention
-- Docker support for easy deployment
-
-## Prerequisites
-
-- Python 3.11 or higher
-- Access to a Bitaxe miner on your network
-- Docker (optional, for containerized deployment)
-- Git (optional, for cloning the repository)
 
 ## Installation
 
 ### Standard Installation
 
-1. Clone the repository:
-```bash
-git clone https://github.com/mrv777/Bitaxe-Hashrate-Benchmark.git
-cd Bitaxe-Hashrate-Benchmark
-```
+1. Clone the repository
 
-2. Create and activate a virtual environment:
-```bash
-python -m venv venv
-# On Windows
-venv\Scripts\activate
-# On Linux/Mac
-source venv/bin/activate
-```
+2. Run build.sh to create the docker container image
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+### Docker compose example:
+```version: "3.9"
 
-### Docker Installation
+services:
+  bitaxe-bench-web:
+    image: bitaxe-bench-web:latest
+    container_name: bitaxe-bench-web
+    restart: unless-stopped
+    ports:
+      - "8020:8000"          # host:container
+    volumes:
+      - bitaxe_bench_data:/app/data
+    environment:
+      # optional, just explicit
+      - PYTHONUNBUFFERED=1
 
-1. Build the Docker image:
-```bash
-docker build -t bitaxe-benchmark .
-```
-
-## Usage
-
-### Standard Usage
-
-Run the benchmark tool by providing your Bitaxe's IP address:
-
-```bash
-python bitaxe_hashrate_benchmark.py <bitaxe_ip>
-```
-
-Optional parameters:
-- `-v, --voltage`: Initial voltage in mV (default: 1150)
-- `-f, --frequency`: Initial frequency in MHz (default: 500)
-
-Example:
-```bash
-python bitaxe_hashrate_benchmark.py 192.168.2.29 -v 1175 -f 775
-```
-
-### Docker Usage (Optional)
-
-Run the container with your Bitaxe's IP address:
-
-```bash
-docker run --rm bitaxe-benchmark <bitaxe_ip> [options]
-```
-
-Example:
-```bash
-docker run --rm bitaxe-benchmark 192.168.2.26 -v 1200 -f 550
-```
+volumes:
+  bitaxe_bench_data:
+    driver: local```
 
 ## Configuration
 
@@ -100,20 +57,6 @@ The script includes several configurable parameters:
 - **Minimum required samples: 7** (for valid data processing)
 - Voltage increment: 20mV
 - Frequency increment: 25MHz
-
-## Output
-
-The benchmark results are saved to `bitaxe_benchmark_results_<ip_address>.json`, containing:
-- Complete test results for all combinations
-- Top 5 performing configurations ranked by hashrate
-- Top 5 most efficient configurations ranked by J/TH
-- For each configuration:
-  - Average hashrate (with outlier removal)
-  - Temperature readings (excluding initial warmup period)
-  - VR temperature readings (when available)
-  - Power efficiency metrics (J/TH)
-  - Input voltage measurements
-  - Voltage/frequency combinations tested
 
 ## Safety Features
 
@@ -153,10 +96,6 @@ The tool implements several data processing techniques to ensure accurate result
 - Averages power consumption across entire test period
 - Monitors VR temperature when available
 - Calculates efficiency in Joules per Terahash (J/TH)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
