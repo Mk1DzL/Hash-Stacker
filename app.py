@@ -1,7 +1,7 @@
 # app.py
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -64,6 +64,7 @@ class BenchmarkCreate(BaseModel):
     min_samples: int = 7
     voltage_increment: int = 20
     frequency_increment: int = 25
+    error_rate_warn_threshold: float = 2.0
 
     notes: str = ""
     profile_name: Optional[str] = None
@@ -119,11 +120,6 @@ def on_runner_finish(runner: BenchmarkRunner, result_path: Optional[str]) -> Non
 def on_startup():
     db.init_db()
     os.makedirs("data/results", exist_ok=True)
-
-
-@app.get("/")
-def root():
-    return {"message": "Go to /static/index.html for the UI"}
 
 
 @app.post("/api/devices/identify")
@@ -232,6 +228,7 @@ def api_list_benchmarks():
             r["progress"] = live.get("progress", 0.0)
             r["status_detail"] = live.get("statusDetail")
             r["recent_results"] = live.get("recentResults", [])
+            r["error_reason"] = live.get("errorReason")   # ← NEW v0.1.1
     return {"runs": rows}
 
 
@@ -397,6 +394,8 @@ def api_update_notes(run_id: str, payload: NoteUpdate):
     conn.close()
     return {"status": "ok"}
 
-@app.get("/")
-def root():
-    return RedirectResponse(url="/static/index.html")
+@app.get("/", include_in_schema=False)
+async def root(request: Request):
+    # This respects root_path and any proxy prefixes
+    url = request.url_for("static", path="index.html")
+    return RedirectResponse(url=url)

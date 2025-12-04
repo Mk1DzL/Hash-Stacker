@@ -333,7 +333,7 @@
       </div>
 
       <div class="row" style="justify-content:flex-end;margin-top:0.5rem;">
-        <button class="btn" id="startBtn">Start benchmark</button>
+        <button class="btn shrink" id="startBtn">Start benchmark</button>
       </div>
     </section>
 
@@ -412,7 +412,9 @@
     const deviceInfoHost = document.getElementById("deviceInfoHost");
     const deviceInfoSummary = document.getElementById("deviceInfoSummary");
     const deviceInfoDetails = document.getElementById("deviceInfoDetails");
-
+    // Remember which runs have their "recent points" panel expanded
+    const expandedRecentPanels = {};
+	
     const CONFIG_FIELDS = [
       ["initial_voltage", "Initial voltage (mV)"],
       ["initial_frequency", "Initial frequency (MHz)"],
@@ -431,6 +433,7 @@
       ["min_samples", "Min required samples"],
       ["voltage_increment", "Voltage increment (mV)"],
       ["frequency_increment", "Frequency increment (MHz)"],
+	  ["error_rate_warn_threshold", "Error-rate failure threshold (%)"], //New addition
     ];
 
     let allProfiles = [];
@@ -446,6 +449,21 @@
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
+    }
+	
+	function describeErrorReason(code) {
+      if (!code) return "";
+      const upper = String(code).toUpperCase();
+      switch (upper) {
+        case "ERROR_RATE_TOO_HIGH":
+          return "error-rate above threshold";
+        case "ZERO_HASHRATE":
+          return "zero hashrate";
+        case "NO_DATA_COLLECTED":
+          return "no valid samples collected";
+        default:
+          return upper.replace(/_/g, " ").toLowerCase();
+      }
     }
 
     function setTheme(theme) {
@@ -825,6 +843,11 @@
       const data = await res.json();
       const runs = data.runs || [];
 
+      const activeIds = new Set(runs.map((r) => r.id));
+      for (const key of Object.keys(expandedRecentPanels)) {
+        if (!activeIds.has(key)) delete expandedRecentPanels[key];
+      }
+
       const active = runs.filter((r) =>
         ["running", "pending"].includes((r.status || "").toLowerCase())
       );
@@ -854,6 +877,32 @@
 
           const statusDetail = (r.status_detail || r.statusDetail || "").trim();
           const recentResults = r.recent_results || r.recentResults || [];
+		  
+		  // NEW: v0.1.1 short failure hint based on error_reason / errorReason
+          const errorReasonRaw = (r.error_reason || r.errorReason || "").trim?.()
+            ? (r.error_reason || r.errorReason).trim()
+            : (r.error_reason || r.errorReason || "");
+          const errorReason = errorReasonRaw
+            ? String(errorReasonRaw).toUpperCase()
+            : "";
+			
+		  let failureHintHtml = "";
+          if (status === "failed" || status === "cancelled") {
+            let friendly = "";
+            if (errorReason === "ERROR_RATE_TOO_HIGH") {
+              friendly = "Error-rate failure";
+            } else if (errorReason === "ZERO_HASHRATE") {
+              friendly = "Zero hashrate";
+            } else if (errorReason) {
+              friendly = describeErrorReason(errorReason);
+            } else if (status === "failed") {
+              // No explicit errorReason → assume hashrate-based failure
+              friendly = "Hashrate below expected";
+            }
+            if (friendly) {
+              failureHintHtml = `<span class="badge failed" style="margin-left:0.35rem;opacity:0.9;">${escapeHtml(friendly)}</span>`;
+            }
+          }
 
           const narrativeHtml = statusDetail
             ? `
@@ -869,7 +918,7 @@
               <div style="flex:1;min-width:180px;">
                 <div class="row" style="margin-bottom:0.25rem;">
                   <div class="mono" style="font-size:0.75rem;">${r.id}</div>
-                  <span class="${badgeClass}">${r.status}</span>
+                  <span class="${badgeClass}">${r.status}</span>${failureHintHtml}
                 </div>
                 <div class="muted" style="font-size:0.8rem;">
                   ${r.device_type} @ ${r.bitaxe_ip}
@@ -906,10 +955,17 @@
           const panel = div.querySelector(`.status-detail-panel[data-panel="${r.id}"]`);
           if (panel) {
             panel.innerHTML = renderRecentPointsTable(recentResults || []);
+
+            // Restore previous open/closed state if we have one
+            const shouldBeOpen = expandedRecentPanels[r.id] === true;
+            panel.style.display = shouldBeOpen ? "block" : "none";
+
             const label = div.querySelector(`.status-detail[data-run="${r.id}"]`);
             if (label) {
               label.addEventListener("click", () => {
-                panel.style.display = panel.style.display === "none" ? "block" : "none";
+                const nowOpen = panel.style.display === "none";
+                panel.style.display = nowOpen ? "block" : "none";
+                expandedRecentPanels[r.id] = nowOpen;
               });
             }
           }

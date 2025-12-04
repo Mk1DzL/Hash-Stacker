@@ -9,6 +9,7 @@ import time
 import json
 import os
 from datetime import datetime
+import math  # NEW
 
 import requests
 
@@ -43,7 +44,7 @@ class BenchmarkConfig:
     frequency_increment: int = 25
     
     # New: optional error-rate threshold (%). If None, we fall back to 2.0.
-    error_rate_warn_threshold: Optional[float] = None
+    error_rate_warn_threshold: Optional[float] = 2.0
 
 
 # Built-in safe-ish overrides per device type
@@ -52,12 +53,16 @@ BUILTIN_PROFILE_OVERRIDES: Dict[DeviceType, Dict[str, Any]] = {
         "max_power": 40,
         "max_temp": 66,
         "max_vr_temp": 86,
+        "min_input_voltage": 4800,
+        "max_input_voltage": 5500,
     },
     DeviceType.NERDQAXE_PP: {
         # Adjust as you learn NerdQaxe++ behavior
         "max_power": 115,
         "max_temp": 70,
         "max_vr_temp": 90,
+        "min_input_voltage": 11800,
+        "max_input_voltage": 12500,
     },
     DeviceType.OTHER: {},
 }
@@ -280,6 +285,7 @@ class BenchmarkRunner:
 
     def cancel(self) -> None:
         self._stop.set()
+        
 
     def to_dict(self, include_results: bool = False) -> Dict[str, Any]:
         with self._lock:
@@ -320,7 +326,108 @@ class BenchmarkRunner:
             1, (cfg.max_allowed_frequency - cfg.initial_frequency) // cfg.frequency_increment + 1
         )
         est = vol_steps * freq_steps
-        return max(1, min(est, 128))  # cap so ETAs don't explode for huge ranges
+        return max(1, min(est, 64))  # cap so ETAs don't explode for huge ranges
+        
+    def _refine_eta_iterations_based_on_headroom(self) -> None:
+        """
+        Refine _approx_total_iterations based on how quickly we are burning
+        through *fan* headroom and, once the fan is saturated, thermal headroom.
+
+        Model:
+          - While the automatic fan curve is still below ~100%, the board is
+            mostly holding ~60°C and the *fan percentage* is the best proxy
+            for "how hard we're pushing".
+          - Once the fan is basically maxed out, further V/F increases show up
+            as a rising chip temperature, so we switch to using temp slope.
+
+        This is deliberately conservative: we only ever LOWER the estimate.
+        """
+        points = self.results
+        # Need a few points to get a meaningful slope
+        if len(points) < 3:
+            return
+
+        cfg = self.config
+        original_est = self._approx_total_iterations
+        if original_est <= len(points) + 1:
+            # Nothing to refine; we're already at or below what we think is left
+            return
+
+        # Look at the last few completed points
+        window_size = min(len(points), 6)
+        window = points[-window_size:]
+
+        def get_series(key: str):
+            vals = [p.get(key) for p in window if isinstance(p.get(key), (int, float))]
+            return vals if len(vals) >= 2 else None
+
+        fan_series = get_series("fanSpeed")
+        temp_series = get_series("averageTemperature")
+
+        # If we don't have fan data, fall back to old-style temp-only refinement.
+        if not fan_series:
+            if not temp_series or not cfg.max_temp:
+                return
+            start_t, end_t = temp_series[0], temp_series[-1]
+            steps = len(temp_series) - 1
+            temp_slope = (end_t - start_t) / steps if steps > 0 else 0.0
+            if temp_slope <= 0.1:  # °C per step
+                return
+            headroom = max(0.0, float(cfg.max_temp) - end_t)
+            est_remaining = headroom / temp_slope
+            predicted_total = len(points) + max(1, int(math.ceil(est_remaining)))
+            predicted_total = max(len(points) + 1, min(predicted_total, original_est))
+            self._approx_total_iterations = predicted_total
+            return
+
+        # --- Phase selection based on fan saturation ---
+        last_fan = fan_series[-1]
+        first_fan = fan_series[0]
+        steps_fan = len(fan_series) - 1
+        fan_slope = (last_fan - first_fan) / steps_fan if steps_fan > 0 else 0.0
+
+        FAN_SAT_THRESHOLD = 95.0  # "basically maxed" on these boards
+        predicted_total = original_est  # default: no change
+
+        if last_fan < FAN_SAT_THRESHOLD:
+            # Fan is still ramping up toward 100%: use fan slope as the primary limiter.
+            # Ignore tiny / noisy slopes.
+            if fan_slope <= 0.25:  # % per iteration
+                return
+
+            headroom_pct = max(0.0, 99.0 - last_fan)  # leave a little buffer below 100%
+            est_steps_to_sat = headroom_pct / fan_slope
+
+            # Add a small fixed tail for the "fan-saturated but not yet thermally limited"
+            # region. This is heuristic but keeps ETA from dropping to zero immediately
+            # when we first hit ~100% fan.
+            est_remaining = est_steps_to_sat + 3.0
+
+            predicted_total = len(points) + max(1, int(math.ceil(est_remaining)))
+        else:
+            # Fan is at or near 100%: now temperature is the interesting limiter.
+            if not temp_series or not cfg.max_temp:
+                # No useful temp info -> don't touch ETA.
+                return
+
+            start_t, end_t = temp_series[0], temp_series[-1]
+            steps_t = len(temp_series) - 1
+            temp_slope = (end_t - start_t) / steps_t if steps_t > 0 else 0.0
+
+            # Require a meaningful positive slope; if temps are flat or falling,
+            # we're not clearly marching toward the thermal ceiling.
+            if temp_slope <= 0.1:
+                return
+
+            headroom_deg = max(0.0, float(cfg.max_temp) - end_t)
+            est_steps_to_thermal = headroom_deg / temp_slope
+
+            predicted_total = len(points) + max(1, int(math.ceil(est_steps_to_thermal)))
+
+        # Clamp so we only shrink (or keep) the estimate; never grow it,
+        # and never say "we're done" before at least one more iteration.
+        predicted_total = max(len(points) + 1, min(predicted_total, original_est))
+        self._approx_total_iterations = predicted_total
 
     def _update_eta(self, iteration_index: int, sample_index: int, total_samples: int) -> None:
         """
@@ -358,6 +465,7 @@ class BenchmarkRunner:
             "POWER_CONSUMPTION_EXCEEDED": "power consumption above configured limit",
             "NO_DATA_COLLECTED": "no valid samples collected",
             "ZERO_HASHRATE": "average hashrate was zero",
+            "ERROR_RATE_TOO_HIGH": "ASIC error rate exceeded configured threshold",
         }
         return mapping.get(code, code.replace("_", " ").lower())
 
@@ -371,6 +479,8 @@ class BenchmarkRunner:
         prev_avg_hashrate: Optional[float],
         prev_avg_temp: Optional[float],
         prev_efficiency: Optional[float],
+        prev_avg_error_pct: Optional[float],
+        prev_expected_hashrate: Optional[float],
     ) -> str:
         cfg = self.config
         total_iters = self._approx_total_iterations
@@ -390,10 +500,43 @@ class BenchmarkRunner:
                 f"increasing frequency by +{cfg.frequency_increment} MHz"
             )
         elif prev_hashrate_ok is False:
-            reason = (
-                "previous run's hashrate was below expected; "
-                f"raising core voltage by +{cfg.voltage_increment} mV and backing off frequency"
-            )
+            # Decide whether we backed off due to error-rate or hashrate
+            threshold = cfg.error_rate_warn_threshold
+            if threshold is None:
+                threshold = 2.0
+
+            if (
+                prev_avg_error_pct is not None
+                and prev_avg_error_pct > threshold
+            ):
+                # Error-rate driven backoff
+                reason = (
+                    f"previous run's ASIC error rate was {prev_avg_error_pct:.2f}% "
+                    f"(threshold {threshold:.2f}%); "
+                    f"raising core voltage by +{cfg.voltage_increment} mV and backing off frequency"
+                )
+            else:
+                # Hashrate-driven backoff
+                if (
+                    prev_avg_hashrate is not None
+                    and prev_expected_hashrate is not None
+                    and prev_expected_hashrate > 0
+                ):
+                    pct_of_target = 100.0 * prev_avg_hashrate / prev_expected_hashrate
+                    reason = (
+                        f"previous run's hashrate was {prev_avg_hashrate:.1f} GH/s "
+                        f"vs expected {prev_expected_hashrate:.1f} GH/s "
+                        f"({pct_of_target:.1f}% of target); "
+                        f"raising core voltage by +{cfg.voltage_increment} mV and backing off frequency"
+                    )
+                else:
+                    # Fallback if we didn't know expected hashrate
+                    reason = (
+                        "previous run's hashrate was below expected; "
+                        f"raising core voltage by +{cfg.voltage_increment} mV and backing off frequency"
+                    )
+
+
         else:
             reason = "continuing sweep based on previous measurements"
 
@@ -434,6 +577,8 @@ class BenchmarkRunner:
         prev_avg_hashrate: Optional[float] = None
         prev_avg_temp: Optional[float] = None
         prev_efficiency: Optional[float] = None
+        prev_avg_error_pct: Optional[float] = None
+        prev_expected_hashrate: Optional[float] = None 
 
         try:
             self._validate_config()
@@ -472,6 +617,8 @@ class BenchmarkRunner:
                         prev_avg_hashrate=prev_avg_hashrate,
                         prev_avg_temp=prev_avg_temp,
                         prev_efficiency=prev_efficiency,
+                        prev_avg_error_pct=prev_avg_error_pct,
+                        prev_expected_hashrate=prev_expected_hashrate, 
                     )
 
                 self._set_system_settings(current_voltage, current_frequency)
@@ -509,6 +656,13 @@ class BenchmarkRunner:
                 if error_reason is not None:
                     # hit some thermal/power/safety limit
                     self.error_reason = error_reason
+                    # If we have no results at all, treat this as a hard failure.
+                    # If we already collected valid points, treat it as a
+                    # graceful stop at the safety limit.
+                    if not self.results:
+                        # full-run failure: nothing usable was collected
+                        self.status = BenchmarkStatus.FAILED
+                    self._stop.set()                               # ← optional, but harmless
                     with self._lock:
                         self.status_detail = (
                             f"Stopping benchmark: {self._describe_error_reason(error_reason)}."
@@ -525,6 +679,11 @@ class BenchmarkRunner:
                     avg_fan_rpm = extras.get("avgFanRpm") if extras else None
                     hashrate_domains = extras.get("hashrateDomains") if extras else None
                     avg_err_pct = extras.get("avgErrorPercentage") if extras else None
+                    expected_hash = extras.get("expectedHashrate") if extras else None
+
+                    # Remember these for the next step's narrative
+                    prev_avg_error_pct = avg_err_pct
+                    prev_expected_hashrate = expected_hash
 
                     result: Dict[str, Any] = {
                         "coreVoltage": current_voltage,
@@ -548,6 +707,9 @@ class BenchmarkRunner:
                         result["hashrateDomains"] = hashrate_domains
 
                     self.results.append(result)
+                    
+                    # Refine ETA based on real cooling / error behaviour
+                    self._refine_eta_iterations_based_on_headroom()
 
                     # update bests
                     if self.best_hashrate is None or avg_hashrate > self.best_hashrate:
@@ -582,11 +744,30 @@ class BenchmarkRunner:
                             if current_frequency < self.config.min_allowed_frequency:
                                 current_frequency = self.config.min_allowed_frequency
                         else:
-                            with self._lock:
-                                self.status_detail = (
+                            # We've hit the voltage ceiling and still don't have an acceptable point.
+                            # Decide whether to classify this as an error-rate failure or a hashrate failure.
+                            threshold = (
+                                self.config.error_rate_warn_threshold
+                                if self.config.error_rate_warn_threshold is not None
+                                else 2.0
+                            )
+
+                            if avg_err_pct is not None and avg_err_pct > threshold:                                
+                                # Persistent high error-rate: stop
+                                self.error_reason = "ERROR_RATE_TOO_HIGH"
+                                msg = (
+                                    "Benchmark stopping: voltage ceiling reached with ASIC error rate above "
+                                    f"threshold ({avg_err_pct:.2f}% > {threshold:.2f}%)."
+                                )
+                            else:
+                                # Treat as hashrate-based ceiling
+                                msg = (
                                     "Benchmark stopping: voltage ceiling reached with suboptimal "
                                     "hashrate; not pushing further."
                                 )
+
+                            with self._lock:
+                                self.status_detail = msg
                             break
                 else:
                     # no data / zero hashrate etc – stop
@@ -597,16 +778,17 @@ class BenchmarkRunner:
                     break
 
             # After loop finishes, reset device
-            self._reset_to_best_or_default()
             if self.results:
                 result_path = self._write_results_json()
-                if self.status != BenchmarkStatus.CANCELLED:
+                if self.status == BenchmarkStatus.RUNNING:
+                    # Only mark completed if we never transitioned to FAILED / CANCELLED
                     self.status = BenchmarkStatus.COMPLETED
                     with self._lock:
                         if not self.status_detail:
                             self.status_detail = (
                                 "Benchmark completed; restored device to best-performing settings."
                             )
+
             else:
                 if self.status != BenchmarkStatus.CANCELLED:
                     self.status = BenchmarkStatus.FAILED
@@ -739,6 +921,7 @@ class BenchmarkRunner:
           avg_vr_temp, error_reason, extras
         """
         cfg = self.config
+        error_reason_local: Optional[str] = None
         hash_rates: List[float] = []
         temps: List[float] = []
         powers: List[float] = []
@@ -950,6 +1133,8 @@ class BenchmarkRunner:
             # Treat this point as "not good enough", which will cause the
             # outer loop to raise V / back off F and re-test.
             hashrate_ok = False
+            # IMPORTANT: do NOT set error_reason_local here; this is not a hard stop
+            #error_reason_local = "ERROR_RATE_TOO_HIGH"
 
         # --- build hashrate domain statistics (min/max/avg/stddev per domain) ---
         hashrate_domains_stats: List[Dict[str, Any]] = []
@@ -1013,10 +1198,13 @@ class BenchmarkRunner:
             extras["avgErrorPercentage"] = avg_error_pct
         if hashrate_domains_stats:
             extras["hashrateDomains"] = hashrate_domains_stats
+        # Also record what the expected hashrate was for this point (if known)
+        if expected_hashrate is not None:
+            extras["expectedHashrate"] = expected_hashrate
         # Optional: record what threshold was used for this run
         extras["errorRateWarnThreshold"] = threshold
 
-        return avg_hash, avg_temp, efficiency_jth, hashrate_ok, avg_vr_temp, None, (extras or None)
+        return avg_hash, avg_temp, efficiency_jth, hashrate_ok, avg_vr_temp, error_reason_local, (extras or None)
 
     # --- cleanup & results writing ---
 

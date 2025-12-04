@@ -359,6 +359,21 @@
       root.setAttribute("data-theme", theme);
       localStorage.setItem("bb_theme", theme);
     }
+	
+	function describeErrorReason(code) {
+      if (!code) return "";
+      const upper = String(code).toUpperCase();
+      switch (upper) {
+        case "ERROR_RATE_TOO_HIGH":
+          return "ASIC error rate exceeded threshold";
+        case "ZERO_HASHRATE":
+          return "average hashrate was zero";
+        case "NO_DATA_COLLECTED":
+          return "no valid samples collected";
+        default:
+          return upper.replace(/_/g, " ").toLowerCase();
+      }
+    }
 
     themeToggle.addEventListener("click", () => {
       const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
@@ -496,6 +511,32 @@
       const ip = run.bitaxe_ip || "–";
       const profile = run.profile_name || run.profile || "–";
       const totalPoints = points.length || "0";
+	  
+	  // NEW: derive a friendly failure reason
+      const rawErr = (run.error_reason || run.errorReason || "");
+      const errorReason = rawErr ? String(rawErr).toUpperCase() : "";
+      const threshold = toNumOrNull(
+        run.config?.error_rate_warn_threshold ??
+        run.config?.errorRateWarnThreshold
+      );
+      let failureReasonLine = "";
+      if (status === "failed" || errorReason) {
+        let msg;
+        if (errorReason === "ERROR_RATE_TOO_HIGH") {
+          const suffix =
+            threshold != null ? ` (threshold ${threshold.toFixed(2)}%)` : "";
+          msg = `failed because ASIC error rate exceeded the configured threshold${suffix}.`;
+        } else if (errorReason === "ZERO_HASHRATE") {
+          msg = "failed because average hashrate was zero.";
+        } else if (errorReason) {
+          msg = `failed due to ${describeErrorReason(errorReason)}.`;
+        } else if (status === "failed") {
+          msg = "failed because hashrate stayed below the expected target.";
+        }
+        if (msg) {
+          failureReasonLine = `<br/>Failure reason: <span class="mono">${msg}</span>`;
+        }
+      }
 
       overviewBody.innerHTML = `
         <div style="margin-bottom:0.35rem;">
@@ -507,6 +548,7 @@
           Started: <span class="mono">${started}</span><br/>
           Finished: <span class="mono">${finished}</span><br/>
           Steps completed: <span class="mono">${totalPoints}</span>
+		  ${failureReasonLine}
         </div>
       `;
 
