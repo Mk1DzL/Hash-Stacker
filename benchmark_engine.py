@@ -778,6 +778,7 @@ class BenchmarkRunner:
                     break
 
             # After loop finishes, reset device
+            self._reset_to_best_or_default()
             if self.results:
                 result_path = self._write_results_json()
                 if self.status == BenchmarkStatus.RUNNING:
