@@ -1212,19 +1212,41 @@ class BenchmarkRunner:
     def _reset_to_best_or_default(self) -> None:
         if self.default_voltage is None or self.default_frequency is None:
             return
-
-        if self.results:
-            best = sorted(
-                self.results,
-                key=lambda x: x["averageHashRate"],
-                reverse=True,
-            )[0]
-            v = best["coreVoltage"]
-            f = best["frequency"]
-        else:
-            v = self.default_voltage
-            f = self.default_frequency
-
+    
+        # No results at all → just go back to defaults
+        if not self.results:
+            self._set_system_settings(self.default_voltage, self.default_frequency)
+            return
+    
+        # Global default / fallback threshold
+        global_threshold = self.config.error_rate_warn_threshold
+        if global_threshold is None:
+            global_threshold = 2.0
+    
+        def is_acceptable(r: Dict[str, Any]) -> bool:
+            err = r.get("errorPercentage")
+            # Prefer the threshold that was actually used during that run, if present
+            thr = r.get("errorRateWarnThreshold", global_threshold)
+    
+            # If we don't have either, treat as acceptable (older firmwares / data)
+            if err is None or thr is None:
+                return True
+    
+            return err <= thr
+    
+        # Filter out high-error runs
+        candidates = [r for r in self.results if is_acceptable(r)]
+    
+        if not candidates:
+            # We found no “good” points; safest is to revert to baseline
+            self._set_system_settings(self.default_voltage, self.default_frequency)
+            return
+    
+        # Pick the highest hashrate among acceptable points
+        best = max(candidates, key=lambda x: x["averageHashRate"])
+        v = best["coreVoltage"]
+        f = best["frequency"]
+    
         self._set_system_settings(v, f)
 
     def _write_results_json(self) -> str:
