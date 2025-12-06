@@ -4,6 +4,8 @@ Based on mrv777's Python-based benchmarking tool, this is a dockerized web gui f
 
 ---
 
+![Multiple systems can test at once](multi_test_progress.png)
+
 ## Overview
 
 This project is a web-based benchmarking harness for Bitaxe / NerdQaxe-class devices.
