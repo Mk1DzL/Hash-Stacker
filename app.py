@@ -22,6 +22,7 @@ from benchmark_engine import (
     DeviceType,
     identify_device,
     make_builtin_config,
+    GridBenchmarkRunner,
 )
 import db
 
@@ -68,6 +69,8 @@ class BenchmarkCreate(BaseModel):
 
     notes: str = ""
     profile_name: Optional[str] = None
+    # NEW: "adaptive" (existing) or "grid" (full V/F sweep)
+    sweep_mode: str = "adaptive"
 
 
 class AutoDetectRequest(BaseModel):
@@ -105,6 +108,13 @@ def builtin_profiles_for_api() -> List[Dict[str, Any]]:
 
 
 def on_runner_finish(runner: BenchmarkRunner, result_path: Optional[str]) -> None:
+    # If the runner has results but didn't pass a path, try to write one now.
+    if not result_path and getattr(runner, "results", None):
+        try:
+            result_path = runner._write_results_json()
+        except Exception:
+            # log if you have logging; don't crash the thread
+            pass
     db.finish_run(
         run_id=runner.run_id,
         status=runner.status.value,
@@ -201,8 +211,11 @@ def api_create_benchmark(payload: BenchmarkCreate):
         notes=payload.notes,
         config=cfg_dict,
     )
+    
+    # NEW: pick runner type based on sweep_mode
+    RunnerClass = GridBenchmarkRunner if cfg.sweep_mode == "grid" else BenchmarkRunner
 
-    runner = BenchmarkRunner(
+    runner = RunnerClass(
         run_id=run_id,
         bitaxe_ip=normalized_ip,
         config=cfg,
@@ -220,7 +233,7 @@ def api_list_benchmarks():
         rid = r["id"]
         if rid in runners:
             runner = runners[rid]
-            live = runner.to_dict(include_results=False)
+            live = runner.to_dict(include_results=True)
             r["status"] = live["status"]
             r["best_hashrate"] = live["bestHashrate"]
             r["best_efficiency"] = live["bestEfficiency"]
@@ -228,7 +241,9 @@ def api_list_benchmarks():
             r["progress"] = live.get("progress", 0.0)
             r["status_detail"] = live.get("statusDetail")
             r["recent_results"] = live.get("recentResults", [])
+            r["results"] = live.get("results", [])
             r["error_reason"] = live.get("errorReason")   # ← NEW v0.1.1
+            r["config"] = live.get("config")
     return {"runs": rows}
 
 
@@ -265,7 +280,13 @@ def api_get_benchmark(run_id: str, include_results: bool = Query(False)):
 
     data: Dict[str, Any] = dict(meta)
     if meta.get("config_json"):
-        data["config"] = meta["config_json"]
+        try:
+            # config_json is stored as a JSON string; parse it so the frontend
+            # can access sweep_mode, etc., as an object.
+            data["config"] = json.loads(meta["config_json"])
+        except Exception:
+            # Fallback: at least return the raw string
+            data["config"] = meta["config_json"]
 
     if include_results and meta.get("result_path"):
         try:
@@ -282,11 +303,30 @@ def api_get_benchmark(run_id: str, include_results: bool = Query(False)):
 @app.post("/api/benchmarks/{run_id}/cancel")
 def api_cancel_benchmark(run_id: str):
     runner = runners.get(run_id)
-    if not runner:
-        raise HTTPException(status_code=404, detail="Run not active")
-    runner.cancel()
-    db.update_run_status(run_id, BenchmarkStatus.CANCELLED.value, error_reason="Cancelled via API")
-    return {"status": "cancel_requested"}
+    if runner:
+        runner.cancel()
+        runner.error_reason = "Cancelled via API"
+        return {"status": "cancel_requested"}
+
+    # No in-memory runner: treat as stale run
+    meta = db.get_run(run_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    status = (meta.get("status") or "").lower()
+    if status not in ("running", "pending"):
+        # Already completed/failed/cancelled; nothing to do
+        return {"status": f"not_running (current status={status})"}
+
+    # Mark it cancelled in the DB so UI can delete it
+    db.update_run_status(
+        run_id,
+        BenchmarkStatus.CANCELLED.value,
+        error_reason="Cancelled with no active runner (likely container restart)",
+    )
+
+    return {"status": "marked_cancelled"}
+
 
 
 @app.delete("/api/benchmarks/{run_id}")
@@ -308,7 +348,7 @@ def api_delete_benchmark(run_id: str):
         raise HTTPException(status_code=404, detail="Run not found")
 
     status = (meta.get("status") or "").lower()
-    if status in ("running", "pending"):
+    if status in ("running", "pending") and runner is not None:
         # DB thinks it's active even if runner isn't; be conservative
         raise HTTPException(
             status_code=400,
@@ -359,8 +399,8 @@ def api_get_benchmark_csv(run_id: str):
         "averageVRTemp",
         "averagePower",
         "efficiencyJTH",
-        "avgFanPct",
-        "avgErrorPercentage",
+        "fanSpeed",
+        "errorPercentage",
     ]
 
     output = io.StringIO()

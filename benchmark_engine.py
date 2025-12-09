@@ -45,6 +45,9 @@ class BenchmarkConfig:
     
     # New: optional error-rate threshold (%). If None, we fall back to 2.0.
     error_rate_warn_threshold: Optional[float] = 2.0
+    
+    # NEW: sweep mode – "adaptive" (current behavior) or "grid"
+    sweep_mode: str = "adaptive"
 
 
 # Built-in safe-ish overrides per device type
@@ -1120,7 +1123,14 @@ class BenchmarkRunner:
             expected_hashrate = expected_from_cores
 
         if expected_hashrate is not None and expected_hashrate > 0:
-            hashrate_ok = (avg_hash >= expected_hashrate * 0.94)
+            mode = (self.config.sweep_mode or "").lower()
+            # Default for adaptive runs: 94% of expected
+            target_ratio = 0.94
+            # Looser threshold for grid testing
+            if mode == "grid":
+                target_ratio = 0.80
+
+            hashrate_ok = (avg_hash >= expected_hashrate * target_ratio)
         else:
             # no idea what "expected" is; don't penalize
             hashrate_ok = True
@@ -1212,48 +1222,44 @@ class BenchmarkRunner:
     def _reset_to_best_or_default(self) -> None:
         if self.default_voltage is None or self.default_frequency is None:
             return
-    
-        # No results at all → just go back to defaults
+
         if not self.results:
             self._set_system_settings(self.default_voltage, self.default_frequency)
             return
-    
-        # Global default / fallback threshold
+
         global_threshold = self.config.error_rate_warn_threshold
         if global_threshold is None:
             global_threshold = 2.0
-    
+
         def is_acceptable(r: Dict[str, Any]) -> bool:
+            # Skip error-only / non-numeric rows
+            if not isinstance(r, dict):
+                return False
+            if "averageHashRate" not in r or "efficiencyJTH" not in r:
+                return False
+            if r.get("valid") is False:
+                return False
+
             err = r.get("errorPercentage")
-            # Prefer the threshold that was actually used during that run, if present
             thr = r.get("errorRateWarnThreshold", global_threshold)
-    
-            # If we don't have either, treat as acceptable (older firmwares / data)
+
             if err is None or thr is None:
                 return True
-    
             return err <= thr
-    
-        # Filter out high-error runs
+
         candidates = [r for r in self.results if is_acceptable(r)]
-    
+
         if not candidates:
-            # We found no “good” points; safest is to revert to baseline
             self._set_system_settings(self.default_voltage, self.default_frequency)
             return
-    
-        # Pick the highest hashrate among acceptable points
+
         best = max(candidates, key=lambda x: x["averageHashRate"])
         v = best["coreVoltage"]
         f = best["frequency"]
-    
         self._set_system_settings(v, f)
 
+
     def _write_results_json(self) -> str:
-        """
-        Writes full results JSON (all results + top performers) to /data/results.
-        Returns the file path.
-        """
         start = self.start_time or datetime.utcnow().isoformat()
         start_ts = start.replace(":", "").replace("-", "")
         filename = f"run_{self.run_id}_{self.bitaxe_ip_raw.replace('.', '-')}_{start_ts}.json"
@@ -1262,12 +1268,24 @@ class BenchmarkRunner:
         os.makedirs(base_dir, exist_ok=True)
         path = os.path.join(base_dir, filename)
 
-        top_by_hash = sorted(
-            self.results, key=lambda x: x["averageHashRate"], reverse=True
-        )[:5]
-        top_by_eff = sorted(
-            self.results, key=lambda x: x["efficiencyJTH"]
-        )[:5]
+        # Only numeric rows for "top" lists
+        numeric_results = [
+            r for r in self.results
+            if isinstance(r, dict)
+            and "averageHashRate" in r
+            and "efficiencyJTH" in r
+        ]
+
+        if numeric_results:
+            top_by_hash = sorted(
+                numeric_results, key=lambda x: x["averageHashRate"], reverse=True
+            )[:5]
+            top_by_eff = sorted(
+                numeric_results, key=lambda x: x["efficiencyJTH"]
+            )[:5]
+        else:
+            top_by_hash = []
+            top_by_eff = []
 
         final_data = {
             "runId": self.run_id,
@@ -1276,6 +1294,7 @@ class BenchmarkRunner:
             "startTime": self.start_time,
             "endTime": self.end_time,
             "config": asdict(self.config),
+            # Keep *all* rows, including error-only ones
             "results": self.results,
             "topPerformers": top_by_hash,
             "mostEfficient": top_by_eff,
@@ -1285,6 +1304,315 @@ class BenchmarkRunner:
             json.dump(final_data, f, indent=2)
 
         return path
+
+
+class GridBenchmarkRunner(BenchmarkRunner):
+    """
+    Variant of BenchmarkRunner that does a full grid sweep across
+    [min_allowed_voltage..max_allowed_voltage] and
+    [min_allowed_frequency..max_allowed_frequency] using the configured increments.
+    """
+
+    def _estimate_total_iterations(self) -> int:
+        cfg = self.config
+        if cfg.frequency_increment <= 0 or cfg.voltage_increment <= 0:
+            return 1
+
+        v_min = min(cfg.min_allowed_voltage, cfg.max_allowed_voltage)
+        v_max = max(cfg.min_allowed_voltage, cfg.max_allowed_voltage)
+        f_min = min(cfg.min_allowed_frequency, cfg.max_allowed_frequency)
+        f_max = max(cfg.min_allowed_frequency, cfg.max_allowed_frequency)
+
+        vol_steps = max(
+            1, (v_max - v_min) // cfg.voltage_increment + 1
+        )
+        freq_steps = max(
+            1, (f_max - f_min) // cfg.frequency_increment + 1
+        )
+        return vol_steps * freq_steps
+
+    def _build_status_detail_grid(
+        self,
+        iteration_index: int,
+        total_iters: int,
+        current_voltage: int,
+        current_frequency: int,
+    ) -> str:
+        iter_label = f"grid point {iteration_index + 1} of ~{total_iters}"
+        return (
+            f"Grid sweep: testing {current_frequency} MHz @ {current_voltage} mV "
+            f"({iter_label}). Will stop early if thermal, power, or input voltage "
+            f"limits are exceeded."
+        )
+
+    def _run(self) -> None:
+        self.start_time = datetime.utcnow().isoformat()
+        self._start_dt = datetime.utcnow()
+        self.status = BenchmarkStatus.RUNNING
+        result_path: Optional[str] = None
+
+        try:
+            self._validate_config()
+            self._fetch_default_settings()
+
+            self._approx_total_iterations = self._estimate_total_iterations()
+            cfg = self.config
+
+            v_min = min(cfg.min_allowed_voltage, cfg.max_allowed_voltage)
+            v_max = max(cfg.min_allowed_voltage, cfg.max_allowed_voltage)
+            f_min = min(cfg.min_allowed_frequency, cfg.max_allowed_frequency)
+            f_max = max(cfg.min_allowed_frequency, cfg.max_allowed_frequency)
+
+            voltages = list(range(v_min, v_max + 1, cfg.voltage_increment))
+            freqs = list(range(f_min, f_max + 1, cfg.frequency_increment))
+
+            iteration_index = 0
+            stop_all = False
+            
+            THERMAL_OR_POWER_LIMIT_ERRORS = {
+                "CHIP_TEMP_EXCEEDED",
+                "VR_TEMP_EXCEEDED",
+                "POWER_CONSUMPTION_EXCEEDED",
+                "INPUT_VOLTAGE_BELOW_MIN",
+                "INPUT_VOLTAGE_ABOVE_MAX",
+                "ERROR_RATE_TOO_HIGH",
+            }
+
+            FATAL_ERRORS = {
+                "SYSTEM_INFO_FAILURE",
+                "MISSING_TEMP_OR_VOLTAGE",
+                "TEMPERATURE_BELOW_5",
+                "MISSING_HASHRATE_OR_POWER",
+                "NO_DATA_COLLECTED",
+                "ZERO_HASHRATE",
+                # add anything else you consider “test is now meaningless”
+            }
+
+            for v in voltages:
+                if stop_all:
+                    break
+                stop_after_this_point = False
+                for fi, f in enumerate(freqs):
+                    if self._stop.is_set():
+                        self.status = BenchmarkStatus.CANCELLED
+                        self.error_reason = "Cancelled by user"
+                        with self._lock:
+                            self.status_detail = (
+                                "Benchmark cancelled by user; cleaning up and "
+                                "restoring device settings."
+                            )
+                        stop_all = True
+                        break
+
+                    self.current_voltage = v
+                    self.current_frequency = f
+
+                    with self._lock:
+                        self.status_detail = self._build_status_detail_grid(
+                            iteration_index,
+                            self._approx_total_iterations,
+                            v,
+                            f,
+                        )
+
+                    self._set_system_settings(v, f)
+                    self._iteration_index = iteration_index
+
+                    (
+                        avg_hashrate,
+                        avg_temp,
+                        efficiency_jth,
+                        hashrate_ok,   # unused for stepping; we still record it
+                        avg_vr_temp,
+                        error_reason,
+                        extras,
+                    ) = self._benchmark_iteration(v, f)
+
+                    iteration_index += 1
+
+                    if self._stop.is_set():
+                        self.status = BenchmarkStatus.CANCELLED
+                        self.error_reason = "Cancelled by user"
+                        with self._lock:
+                            self.status_detail = (
+                                "Benchmark cancelled by user; cleaning up and "
+                                "restoring device settings."
+                            )
+                        stop_all = True
+                        break
+
+                    if error_reason is not None:
+                        # hit thermal / power / voltage limit – treat as a ceiling,
+                        # but still keep any points we collected so far.
+                        self.error_reason = error_reason
+                        if error_reason in THERMAL_OR_POWER_LIMIT_ERRORS:
+                            remaining_at_this_voltage = len(freqs) - (fi + 1)
+                            if remaining_at_this_voltage > 0:
+                                # shrink our estimate so ETA stops counting skipped points
+                                self._approx_total_iterations = max(
+                                    iteration_index,  # never less than what we've already done
+                                    self._approx_total_iterations - remaining_at_this_voltage,
+                                )
+                            # Record the failing grid point
+                            self.results.append({
+                                "runId": self.run_id,
+                                "device": self.config.device_type.value,
+                                "coreVoltage": v,
+                                "frequency": f,
+                                "errorReason": error_reason,
+                                "valid": False,
+                            })
+
+                            with self._lock:
+                                self.status_detail = (
+                                    f"Grid: {self._describe_error_reason(error_reason)} at "
+                                    f"{f} MHz @ {v} mV — stopping higher frequencies at this voltage."
+                                )
+
+                            # Early-exit for this *voltage*: do not test higher freqs at this V
+                            break
+
+                        # Everything else is treated as a fatal problem; bail out
+                        if error_reason in FATAL_ERRORS:
+                            # we’re done with the sweep entirely; adjust total iterations to what we’ve done
+                            self._approx_total_iterations = iteration_index
+                            with self._lock:
+                                self.status_detail = (
+                                    "Stopping grid sweep: "
+                                    f"{self._describe_error_reason(error_reason)}."
+                                )
+                            stop_all = True
+                            break
+                        if not self.results:
+                            self.status = BenchmarkStatus.FAILED
+                        with self._lock:
+                            self.status_detail = (
+                                f"Stopping grid sweep: "
+                                f"{self._describe_error_reason(error_reason)}."
+                            )
+                        stop_all = True
+                        break
+                    
+                    # If we didn't hit a hard error, but hashrate_ok is False, treat this as a
+                    # "soft ceiling" for this voltage: record the point, then stop stepping higher F.
+                    if error_reason is None and hashrate_ok is False:
+                        # We still want to record the point we just measured
+                        # (that happens in the block below), so don't `continue` or `return`.
+
+                        remaining_at_this_voltage = len(freqs) - (fi + 1)
+                        if remaining_at_this_voltage > 0:
+                            # Shrink ETA so we don't count skipped points at this V
+                            self._approx_total_iterations = max(
+                                iteration_index,
+                                self._approx_total_iterations - remaining_at_this_voltage,
+                            )
+
+                        with self._lock:
+                            self.status_detail = (
+                                "Grid: hashrate under expected at "
+                                f"{f} MHz @ {v} mV — stopping higher frequencies at this voltage."
+                            )
+
+                        # We'll break out of the freq loop *after* we append this result below.
+                        stop_after_this_point = True
+                    else:
+                        stop_after_this_point = False
+
+                    if (
+                        avg_hashrate is not None
+                        and avg_temp is not None
+                        and efficiency_jth is not None
+                    ):
+                        avg_power = extras.get("avgPower") if extras else None
+                        avg_fan_pct = extras.get("avgFanPct") if extras else None
+                        avg_fan_rpm = extras.get("avgFanRpm") if extras else None
+                        hashrate_domains = extras.get("hashrateDomains") if extras else None
+                        avg_err_pct = extras.get("avgErrorPercentage") if extras else None
+                        expected_hash = extras.get("expectedHashrate") if extras else None
+                        used_threshold = extras.get("errorRateWarnThreshold")
+
+                        result: Dict[str, Any] = {
+                            "coreVoltage": v,
+                            "frequency": f,
+                            "averageHashRate": avg_hashrate,
+                            "averageTemperature": avg_temp,
+                            "efficiencyJTH": efficiency_jth,
+                        }
+                        if avg_power is not None:
+                            result["averagePower"] = avg_power
+                        if avg_vr_temp is not None:
+                            result["averageVRTemp"] = avg_vr_temp
+                        if avg_fan_pct is not None:
+                            result["fanSpeed"] = avg_fan_pct
+                        if avg_fan_rpm is not None:
+                            result["fanRPM"] = avg_fan_rpm
+                        if avg_err_pct is not None:
+                            result["errorPercentage"] = avg_err_pct
+                        if hashrate_domains is not None:
+                            result["hashrateDomains"] = hashrate_domains
+                        if used_threshold is not None:
+                            result["errorRateWarnThreshold"] = used_threshold
+                        if expected_hash is not None:
+                            result["expectedHashrate"] = expected_hash
+
+                        self.results.append(result)
+
+                        # Update "best" metrics same as adaptive mode
+                        if self.best_hashrate is None or avg_hashrate > self.best_hashrate:
+                            self.best_hashrate = avg_hashrate
+                        if self.best_efficiency is None or efficiency_jth < self.best_efficiency:
+                            self.best_efficiency = efficiency_jth
+                        
+                        if stop_after_this_point:
+                            break  # stop stepping to higher frequencies at this V
+    
+                    else:
+                        with self._lock:
+                            self.status_detail = (
+                                "Benchmark stopping: no valid data collected at this grid point."
+                            )
+                        stop_all = True
+                        break
+
+            # After grid completes (or stops early), restore device
+            self._reset_to_best_or_default()
+            if self.results:
+                result_path = self._write_results_json()
+                if self.status == BenchmarkStatus.RUNNING:
+                    self.status = BenchmarkStatus.COMPLETED
+                    with self._lock:
+                        if not self.status_detail:
+                            self.status_detail = (
+                                "Grid sweep completed; restored device to "
+                                "best-performing settings."
+                            )
+            else:
+                if self.status != BenchmarkStatus.CANCELLED:
+                    self.status = BenchmarkStatus.FAILED
+                    if self.error_reason is None:
+                        self.error_reason = "NO_DATA_COLLECTED"
+                    with self._lock:
+                        self.status_detail = (
+                            f"Benchmark failed: "
+                            f"{self._describe_error_reason(self.error_reason)}."
+                        )
+
+        except Exception as e:
+            self.status = BenchmarkStatus.FAILED
+            self.error_reason = f"Unexpected error: {e}"
+            with self._lock:
+                self.status_detail = f"Benchmark failed due to unexpected error: {e}."
+            try:
+                self._reset_to_best_or_default()
+            except Exception:
+                pass
+        finally:
+            self.end_time = datetime.utcnow().isoformat()
+            if self.on_finish:
+                try:
+                    self.on_finish(self, result_path)
+                except Exception:
+                    pass
 
 
 def config_from_dict(data: Dict[str, Any]) -> BenchmarkConfig:
