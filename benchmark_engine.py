@@ -1376,6 +1376,7 @@ class GridBenchmarkRunner(BenchmarkRunner):
                 "INPUT_VOLTAGE_BELOW_MIN",
                 "INPUT_VOLTAGE_ABOVE_MAX",
                 "ERROR_RATE_TOO_HIGH",
+                "ZERO_HASHRATE",
             }
 
             FATAL_ERRORS = {
@@ -1384,7 +1385,6 @@ class GridBenchmarkRunner(BenchmarkRunner):
                 "TEMPERATURE_BELOW_5",
                 "MISSING_HASHRATE_OR_POWER",
                 "NO_DATA_COLLECTED",
-                "ZERO_HASHRATE",
                 # add anything else you consider “test is now meaningless”
             }
 
