@@ -172,6 +172,16 @@
       gap: 1rem;
       margin-top: 0.75rem;
     }
+	/* When the section has the "heatmaps-large" class, stack vertically */
+	#heatmapSection.heatmaps-large .heatmaps-grid {
+	  grid-template-columns: minmax(0, 1fr); /* single column */
+	}
+
+	/* Optional: allow horizontal scroll if a single heatmap is very wide */
+	.heatmap-card {
+	  overflow-x: auto;
+	}
+
     .heatmap-card h3 {
       font-size: 0.9rem;
       margin: 0 0 0.35rem;
@@ -386,14 +396,26 @@
           <div id="heatmapEffContainer"></div>
         </div>
         <div class="heatmap-card">
-          <h3>Error rate (%)</h3>
-          <div id="heatmapErrContainer"></div>
-        </div>
+		  <div class="row" style="align-items:center;justify-content:space-between;gap:0.5rem;">
+			<h3 id="heatmapMetricLabel" style="margin:0;">Error rate (%)</h3>
+			<select id="heatmapMetricSelect" style="max-width:200px;">
+			  <option value="err" selected>Error rate (%)</option>
+			  <option value="pow">Power (W)</option>
+			  <option value="chip">Chip temp (°C)</option>
+			  <option value="vr">VRM temp (°C)</option>
+			  <option value="fanPct">Fan speed (%)</option>
+			  <option value="fanRpm">Fan speed (RPM)</option>
+			</select>
+		  </div>
+		  <div id="heatmapErrContainer"></div>
+		</div>
+
       </div>
 
       <div class="muted" style="font-size:0.72rem;margin-top:0.4rem;">
-        Rows are core voltage (mV), columns are frequency (MHz).
+        Columns are set core voltages (mV), rows are frequency (MHz).
         Colors go from red (worst) to green (best).
+		Purple cells mark grid points that hit an error or safety limit.
         Empty cells mean that particular combo wasn’t measured or failed early.
       </div>
     </section>
@@ -433,7 +455,8 @@
     const heatmapHashContainer = document.getElementById("heatmapHashContainer");
     const heatmapEffContainer = document.getElementById("heatmapEffContainer");
     const heatmapErrContainer = document.getElementById("heatmapErrContainer");
-
+	const heatmapMetricSelect = document.getElementById("heatmapMetricSelect");
+	const heatmapMetricLabel = document.getElementById("heatmapMetricLabel");
 
     function setTheme(theme) {
       root.setAttribute("data-theme", theme);
@@ -514,6 +537,56 @@
       return { bestHashIndex, bestEffIndex, bestHashValue, bestEffValue };
     }
 	
+	const HEATMAP_METRICS = {
+	  err: {
+		key: "err",
+		label: "error rate (%)",
+		title: "Error rate (%)",
+		invert: true,   // lower error = greener
+		decimals: 2,
+	  },
+	  pow: {
+		key: "pow",
+		label: "power (W)",
+		title: "Power (W)",
+		invert: true,   // treat lower power as "better" for color
+		decimals: 1,
+	  },
+	  chip: {
+		key: "chip",
+		label: "chip temp (°C)",
+		title: "Chip temperature (°C)",
+		invert: true,   // lower temp = better
+		decimals: 1,
+	  },
+	  vr: {
+		key: "vr",
+		label: "VRM temp (°C)",
+		title: "VRM temperature (°C)",
+		invert: true,
+		decimals: 1,
+	  },
+	  fanPct: {
+		key: "fanPct",
+		label: "fan speed (%)",
+		title: "Fan speed (%)",
+		invert: true,   // lower fan % = "better" noise-wise
+		decimals: 0,
+	  },
+	  fanRpm: {
+		key: "fanRpm",
+		label: "fan speed (RPM)",
+		title: "Fan speed (RPM)",
+		invert: true,
+		decimals: 0,
+	  },
+	};
+
+	// We'll stash the last-computed grid so the selector
+	// can redraw without re-fetching data.
+	let lastHeatmapContext = null;
+
+	
 	function buildHeatmaps(points, resultsRoot, run) {
 	  if (!heatmapSection) return;
 
@@ -555,6 +628,14 @@
 		heatmapSection.style.display = "none";
 		return;
 	  }
+	  
+	  // NEW: stack vertically for large grids
+	  const isLargeGrid =
+	    voltages.length >= 5 ||      // many voltage steps
+	    freqs.length >= 6  ||        // many freq steps
+	    (voltages.length * freqs.length) >= 30; // or just lots of points
+
+	  heatmapSection.classList.toggle("heatmaps-large", isLargeGrid);
 
 	  heatmapSection.style.display = "block";
 	  heatmapMeta.textContent =
@@ -575,6 +656,12 @@
 		  eff:      toNumOrNull(p.efficiencyJTH ?? p.efficiency ?? p.j_per_th),
 		  err:      toNumOrNull(p.errorPercentage ?? p.error_pct ?? p.errorRate),
 		  errorReason,
+		  // NEW: extra metrics for the selector
+		  pow:     toNumOrNull(p.averagePower ?? p.power ?? p.power_watts),
+		  chip:    toNumOrNull(p.averageTemperature ?? p.temp ?? p.temperature),
+		  vr:      toNumOrNull(p.averageVRTemp ?? p.vrTemp ?? p.vr_temperature),
+		  fanPct:  toNumOrNull(p.fanSpeed ?? p.fan_pct ?? p.fanspeed),
+		  fanRpm:  toNumOrNull(p.fanRPM ?? p.fan_rpm ?? p.fanrpm),
 		};
 
 		if (!rowMeta[v]) {
@@ -586,6 +673,9 @@
 		  rowMeta[v].hadFailure = true;
 		}
 	  });
+	  
+	  // Save context for selector-driven redraws
+	  lastHeatmapContext = { voltages, freqs, lookup, rowMeta };
 
 	  buildSingleHeatmap(heatmapHashContainer, voltages, freqs, lookup, "hashrate", {
 		label: "GH/s",
@@ -599,11 +689,47 @@
 		decimals: 2,
 	  }, rowMeta);
 
-	  buildSingleHeatmap(heatmapErrContainer, voltages, freqs, lookup, "err", {
-		label: "%",
-		invert: true,
-		decimals: 2,
-	  }, rowMeta);
+	  // Third one uses the selector:
+	  const selectedKey = (heatmapMetricSelect && heatmapMetricSelect.value) || "err";
+	  const metricCfg = HEATMAP_METRICS[selectedKey] || HEATMAP_METRICS.err;
+
+	  if (heatmapMetricLabel) {
+	    heatmapMetricLabel.textContent = metricCfg.title;
+	  }
+
+	  buildSingleHeatmap(
+	    heatmapErrContainer,          // still using this container
+	    voltages,
+	    freqs,
+	    lookup,
+	    metricCfg.key,
+	    metricCfg,
+	    rowMeta
+	  );
+	}
+	
+	if (heatmapMetricSelect) {
+	  heatmapMetricSelect.addEventListener("change", () => {
+		if (!lastHeatmapContext) return;
+
+		const { voltages, freqs, lookup, rowMeta } = lastHeatmapContext;
+		const selectedKey = heatmapMetricSelect.value || "err";
+		const metricCfg = HEATMAP_METRICS[selectedKey] || HEATMAP_METRICS.err;
+
+		if (heatmapMetricLabel) {
+		  heatmapMetricLabel.textContent = metricCfg.title;
+		}
+
+		buildSingleHeatmap(
+		  heatmapErrContainer,
+		  voltages,
+		  freqs,
+		  lookup,
+		  metricCfg.key,
+		  metricCfg,
+		  rowMeta
+		);
+	  });
 	}
 
     function buildSingleHeatmap(container, voltages, freqs, lookup, key, opts, rowMeta) {
@@ -612,11 +738,27 @@
 	  voltages.forEach((v) => {
 		freqs.forEach((f) => {
 		  const entry = lookup[`${v}|${f}`];
-		  if (entry && entry[key] != null && isFinite(entry[key])) {
-			values.push(entry[key]);
+		  if (!entry) return;
+
+		  const val = entry[key];
+
+		  // Treat explicit error points and 0‑hashrate points as "error cells"
+		  // and exclude them from the color scale.
+		  const isErrorCell =
+			!!entry.errorReason ||
+			(key === "hashrate" && (val === 0 || val === 0.0));
+
+		  if (!isErrorCell && val != null && isFinite(val)) {
+			// For hashrate, we also ignore <= 0 in the scale even if the backend
+			// didn’t explicitly tag it as an error.
+			if (key === "hashrate" && val <= 0) {
+			  return;
+			}
+			values.push(val);
 		  }
 		});
 	  });
+
 
 	  if (!values.length) {
 		container.innerHTML =
@@ -660,21 +802,29 @@
 		  let text = "";
 		  let extraClass = "";
 
-		  if (entry && entry.errorReason) {
-		    // Explicit failure at this grid point → solid red
-		    bg = "hsl(0, 80%, 40%)";
-		    extraClass = "heatmap-failed";
-		    text = "";
+		  const isErrorCell =
+			entry &&
+			(
+			  entry.errorReason ||
+			  entry.hashrate === 0 ||
+			  entry.hashrate === 0.0
+			);
+
+		  if (isErrorCell) {
+			// Match index mini heatmap: failed points are purple.
+			bg = "hsl(270, 80%, 45%)";
+			extraClass = "heatmap-failed";
+			text = "";
 		  } else if (!entry && meta && meta.hadFailure && f > meta.maxFreq) {
-		    // We stopped the sweep at a lower freq for this voltage → skipped
-		    bg = "rgba(148, 163, 184, 0.4)";
-		    extraClass = "heatmap-skipped";
+			// We stopped the sweep at a lower freq for this voltage → skipped
+			bg = "rgba(148, 163, 184, 0.4)";
+			extraClass = "heatmap-skipped";
 		  } else {
-		    bg = colorFor(baseVal);
-		    text =
-		  	  baseVal == null || !isFinite(baseVal)
-			    ? ""
-			    : fmtNumber(baseVal, opts.decimals);
+			bg = colorFor(baseVal);
+			text =
+			  baseVal == null || !isFinite(baseVal)
+				? ""
+				: fmtNumber(baseVal, opts.decimals);
 		  }
 
 		  html += `<td class="${extraClass}" style="background:${bg};"><span class="heatmap-cell-value">${text}</span></td>`;
@@ -777,23 +927,26 @@
         run.config?.errorRateWarnThreshold
       );
       let failureReasonLine = "";
-      if (status === "failed" || errorReason) {
-        let msg;
-        if (errorReason === "ERROR_RATE_TOO_HIGH") {
-          const suffix =
-            threshold != null ? ` (threshold ${threshold.toFixed(2)}%)` : "";
-          msg = `failed because ASIC error rate exceeded the configured threshold${suffix}.`;
-        } else if (errorReason === "ZERO_HASHRATE") {
-          msg = "failed because average hashrate was zero.";
-        } else if (errorReason) {
-          msg = `failed due to ${describeErrorReason(errorReason)}.`;
-        } else if (status === "failed") {
-          msg = "failed because hashrate stayed below the expected target.";
-        }
-        if (msg) {
-          failureReasonLine = `<br/>Failure reason: <span class="mono">${msg}</span>`;
-        }
-      }
+      // Only show a failure reason when the overall run actually failed.
+	  if (status === "failed") {
+	    let msg;
+	    if (errorReason === "ERROR_RATE_TOO_HIGH") {
+		  const suffix =
+		    threshold != null ? ` (threshold ${threshold.toFixed(2)}%)` : "";
+		  msg = `failed because ASIC error rate exceeded the configured threshold${suffix}.`;
+	    } else if (errorReason === "ZERO_HASHRATE") {
+		  msg = "failed because average hashrate was zero.";
+	    } else if (errorReason) {
+		  msg = `failed due to ${describeErrorReason(errorReason)}.`;
+	    } else {
+		  // Failed but no explicit errorReason → generic hashrate-based failure.
+		  msg = "failed because hashrate stayed below the expected target.";
+	    }
+
+	    if (msg) {
+		  failureReasonLine = `<br/>Failure reason: <span class="mono">${msg}</span>`;
+	    }
+	  }
 
       overviewBody.innerHTML = `
         <div style="margin-bottom:0.35rem;">
