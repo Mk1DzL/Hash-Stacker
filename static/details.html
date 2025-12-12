@@ -405,6 +405,7 @@
 			  <option value="vr">VRM temp (°C)</option>
 			  <option value="fanPct">Fan speed (%)</option>
 			  <option value="fanRpm">Fan speed (RPM)</option>
+			  <option value="expected">Expected hash rate (GH/s)</option>
 			</select>
 		  </div>
 		  <div id="heatmapErrContainer"></div>
@@ -603,7 +604,7 @@
 		key: "expected",
 		label: "expected hash rate (GH/s)",
 		title: "Expected hash rate (GH/s)",
-		invert: true,
+		invert: false,
 		decimals: 0,
 	  },
 	};
@@ -679,7 +680,7 @@
 
 		lookup[key] = {
 		  hashrate: toNumOrNull(p.averageHashRate ?? p.hashRate ?? p.average_hashrate),
-		  expected: toNumOrNull(p.expectedHashrate ?? p.expected_hashrate),
+		  expected: toNumOrNull(p.expectedHashRate ?? p.expectedHashrate ?? p.expected_hashrate),
 		  eff:      toNumOrNull(p.efficiencyJTH ?? p.efficiency ?? p.j_per_th),
 		  err:      toNumOrNull(p.errorPercentage ?? p.error_pct ?? p.errorRate),
 		  errorReason,
