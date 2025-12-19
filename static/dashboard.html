@@ -704,6 +704,21 @@
       100%{ opacity:0; transform: translate(-50%, calc(100vh - 24px)) rotate(340deg) scale(0.9); }
     }
 
+
+    /* Coin physics mode (optional) */
+    .coin.coin-phys{
+      left: 0;
+      top: 0;
+      opacity: 1;
+      transform: translate(0px,0px) rotate(0deg) scale(1);
+      animation: none !important;
+      will-change: transform, opacity;
+    }
+    .coin.coin-fade{
+      transition: opacity 1000ms linear;
+      opacity: 0 !important;
+    }
+
     @media (max-width: 820px){
       header{ flex-direction:column; align-items:flex-start; }
       .toolbar{ justify-content:flex-start; }
@@ -1011,6 +1026,22 @@
             <option value="0">Off</option>
           </select>
         </div>
+
+        <div>
+          <label>Coin physics mode</label>
+          <select id="coinPhysics">
+            <option value="0">Off (classic drop)</option>
+            <option value="1">On (bounce & pile)</option>
+          </select>
+          <div class="hint">Adds a little “pop”, collisions, and piling. When the cap is reached, oldest coins fade out.</div>
+        </div>
+
+        <div>
+          <label for="coinPop">Physics pop strength</label>
+          <input id="coinPop" type="range" min="0" max="1200" step="20" />
+          <div class="hint" id="coinPopLabel">–</div>
+        </div>
+
       </div>
 
 
@@ -1226,6 +1257,11 @@ const $ = (id) => document.getElementById(id);
   const soundPitchJitterLabel = $("soundPitchJitterLabel");
   const maxCoins = $("maxCoins");
 
+  const coinPhysics = $("coinPhysics");
+  const coinPop = $("coinPop");
+  const coinPopLabel = $("coinPopLabel");
+
+
   const saveSettingsBtn = $("saveSettingsBtn");
   const saveAllBtn = $("saveAllBtn");
 
@@ -1255,6 +1291,16 @@ const $ = (id) => document.getElementById(id);
   let activeSoundUrl = null;
   let activeSoundEl = null;
   let coinCount = 0;
+
+  // coin physics state
+  const coinBodies = []; // {el,x,y,vx,vy,r,angle,av,birth,fading}
+  let coinRaf = 0;
+  let coinLastT = 0;
+
+  // coin cap management (soft max): avoid "pop" when lots of coins spawn at once
+  let coinPruneTimer = 0;      // setTimeout handle (0 = none)
+  let coinPruneRaf = 0;        // RAF handle (0 = none)
+
 
   function escapeHtml(str){
     if (str == null) return "";
@@ -1625,59 +1671,83 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
   function th(){ return getThresholds(); }
 
-  function bindCardInteractions(){
-    // clicking card opens details (but not when clicking menu)
-    document.querySelectorAll(".miner-card").forEach(card => {
-      card.addEventListener("click", (e) => {
-        const tgt = e.target;
-        if (tgt && (tgt.closest(".menuBtn") || tgt.closest(".menu"))) return;
-        const id = Number(card.getAttribute("data-id"));
-        const dev = devices.find(d => d.id === id);
-        if (dev) openDetails(dev);
-      });
-    });
+  let cardDelegationInstalled = false;
 
-    // menu toggles
-    document.querySelectorAll("[data-menu]").forEach(btn => {
-      btn.addEventListener("click", (e) => {
+  function closeAllMenus(){
+    document.querySelectorAll(".menu").forEach(m => m.classList.remove("open"));
+  }
+
+  function bindCardInteractions(){
+    if (cardDelegationInstalled) return;
+    cardDelegationInstalled = true;
+											 
+							 
+																			 
+														
+												   
+								  
+		 
+	   
+
+    // One handler for all card/menu interactions (event delegation)
+															 
+    cardsEl.addEventListener("click", async (e) => {
+      const menuToggle = e.target.closest("[data-menu]");
+      if (menuToggle){
         e.stopPropagation();
-        const id = btn.getAttribute("data-menu");
+        const id = menuToggle.getAttribute("data-menu");
         const menu = document.getElementById("menu_" + id);
         if (!menu) return;
         // close others
         document.querySelectorAll(".menu").forEach(m => { if (m !== menu) m.classList.remove("open"); });
         menu.classList.toggle("open");
-      });
-    });
-    document.addEventListener("click", () => {
-      document.querySelectorAll(".menu").forEach(m => m.classList.remove("open"));
-    });
+        return;
+      }
+											  
+																				  
+	   
 
-    // menu actions
-    document.querySelectorAll(".menu button").forEach(btn => {
-      btn.addEventListener("click", async (e) => {
+      const actionBtn = e.target.closest(".menu button");
+      if (actionBtn){
+												  
         e.stopPropagation();
-        const act = btn.getAttribute("data-action");
-        const id = Number(btn.getAttribute("data-id") || "0");
+        const act = actionBtn.getAttribute("data-action");
+        const id = Number(actionBtn.getAttribute("data-id") || "0");
+
         if (act === "remove"){
           if (!confirm("Remove this system from the dashboard?")) return;
           await removeDevice(id);
           return;
         }
+
         if (act === "copyip"){
-          const ip = btn.getAttribute("data-ip");
+          const ip = actionBtn.getAttribute("data-ip");
           try{ await navigator.clipboard.writeText(ip); }catch(_){}
-          btn.textContent = "Copied ✓";
-          setTimeout(() => (btn.textContent = "Copy IP"), 900);
+          const old = actionBtn.textContent || "Copy IP";
+          actionBtn.textContent = "Copied ✓";
+          setTimeout(() => (actionBtn.textContent = old), 900);
           return;
         }
+
         if (act === "details"){
           const dev = devices.find(d => d.id === id);
           if (dev) openDetails(dev);
           return;
         }
-      });
+        return;
+      }
+
+      const card = e.target.closest(".miner-card");
+      if (card){
+        const tgt = e.target;
+        if (tgt && (tgt.closest(".menuBtn") || tgt.closest(".menu"))) return;
+        const id = Number(card.getAttribute("data-id"));
+        const dev = devices.find(d => d.id === id);
+        if (dev) openDetails(dev);
+      }
     });
+
+    document.addEventListener("click", closeAllMenus);
   }
 
   function kvRow(k, v){
@@ -1849,6 +1919,15 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
       if (shakeDurationLabel) shakeDurationLabel.textContent = `${fmtInt(dur)}ms`;
     }
     coinEnabled.value = anim.coin_drop ? "1" : "0";
+
+    if (coinPhysics) coinPhysics.value = (anim.coin_physics ? "1" : "0");
+    if (coinPop){
+      const pop = Number(anim.coin_pop_strength ?? 520);
+      const clamped = Math.max(0, Math.min(1200, pop));
+      coinPop.value = String(clamped);
+      if (coinPopLabel) coinPopLabel.textContent = `${fmtInt(clamped)} px/s`;
+    }
+
     soundEnabled.value = anim.sound_on_share ? "1" : "0";
     soundVol.value = anim.sound_volume ?? 0.35;
     if (soundPitchJitter){
@@ -1863,6 +1942,8 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     applyGridColumns();
     applyAppearance();
     applyAnimationVars();
+
+    updateCoinPhysicsConfig();
 
     // Load active assets
     await refreshAssets();
@@ -1888,6 +1969,10 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
         shake_intensity_px: Number(shakeIntensity?.value ?? 2),
         shake_duration_ms: Number(shakeDuration?.value ?? 280),
         coin_drop: String(coinEnabled.value) === "1",
+
+        coin_physics: (String(coinPhysics?.value) === "1"),
+        coin_pop_strength: Number(coinPop?.value ?? 520),
+
         sound_on_share: String(soundEnabled.value) === "1",
         sound_volume: Number(soundVol.value || 0),
         sound_pitch_jitter: Number(soundPitchJitter?.value || 0),
@@ -1927,6 +2012,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     applyGridColumns();
     applyAppearance();
     applyAnimationVars();
+    updateCoinPhysicsConfig();
     restartPolling();
   }
 
@@ -1985,6 +2071,27 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     }
   });
 
+
+
+  coinPop?.addEventListener("input", () => {
+    if (!settings) return;
+    const v = Math.max(0, Math.min(1200, Number(coinPop.value || 0)));
+    settings.animations = settings.animations || {};
+    settings.animations.coin_pop_strength = v;
+    if (coinPopLabel) coinPopLabel.textContent = `${fmtInt(v)} px/s`;
+  });
+  coinPop?.addEventListener("change", async () => {
+    try{ await saveSettings({ animations: collectSettingsFromUI().animations }); }
+    catch(e){ alert("Failed to save: " + e.message); }
+  });
+
+  coinPhysics?.addEventListener("change", async () => {
+    if (!settings) return;
+    settings.animations = settings.animations || {};
+    settings.animations.coin_physics = (String(coinPhysics.value) === "1");
+    try{ await saveSettings({ animations: collectSettingsFromUI().animations }); }
+    catch(e){ alert("Failed to save: " + e.message); }
+  });
 
   shakeIntensity?.addEventListener("input", () => {
     if (!settings) return;
@@ -2547,9 +2654,25 @@ async function loadDevices(){
 
     if (anim.coin_drop){
       const coinsToDrop = Math.min(Math.max(1, delta || 1), 3);
-      for (let i=0;i<coinsToDrop;i++){
-        if (coinCount >= Number(anim.max_coins ?? 35)) break;
-        dropCoinFromCard(card);
+      const max = Number(anim.max_coins ?? 35);
+
+      if (anim.coin_physics){
+        // Soft max: make room for the whole burst up-front so we don't end up
+        // immediately fading freshly-spawned coins (which can look like a "pop").
+		
+		// Physics mode: spawn immediately; if we exceed the cap during a burst, we prune smoothly after.
+        //ensureCoinCapacity(coinsToDrop); Removed - can re-add if persistent overflow ends up being drastic.
+        for (let i=0;i<coinsToDrop;i++){
+          dropCoinFromCard(card);
+        }
+        // If the burst itself exceeded the cap, we'll prune down smoothly after a frame.
+        scheduleCoinPrune(0);
+      }else{
+        // Classic mode: hard cap by count.
+        for (let i=0;i<coinsToDrop;i++){
+          if (coinCount >= max) break;
+          dropCoinFromCard(card);
+        }
       }
     }
 
@@ -2572,7 +2695,330 @@ async function loadDevices(){
     }
   }
 
-  function dropCoinFromCard(card){
+
+  // --- Coins (CSS drop + optional physics mode) ---
+
+  function removeCoinBody(b){
+    const idx = coinBodies.indexOf(b);
+    if (idx >= 0) coinBodies.splice(idx, 1);
+    try{ b.el.remove(); }catch(_){}
+    coinCount = Math.max(0, coinCount - 1);
+  }
+
+  function fadeOldestCoins(n, minAgeMs=0){
+    if (!n || n <= 0) return 0;
+
+    const now = performance.now();
+    const pickOldest = (arr, k) => arr
+      .filter(b => b && !b.fading)
+      .sort((a,b) => a.birth - b.birth)
+      .slice(0, k);
+
+    // Prefer coins that have been on-screen long enough to have painted at least once,
+    // but if we still need to prune, we'll include younger ones too.
+    const eligible = coinBodies.filter(b => b && !b.fading && ((now - b.birth) >= minAgeMs));
+    let targets = pickOldest(eligible, n);
+
+    if (targets.length < n){
+      const remaining = n - targets.length;
+      const rest = coinBodies.filter(b => b && !b.fading && !targets.includes(b));
+      targets = targets.concat(pickOldest(rest, remaining));
+    }
+
+    for (const b of targets){
+      b.fading = true;
+
+      // Make the fade transition reliable (no occasional "pop" when lots spawn in one tick).
+      try{ b.el.style.opacity = "1"; }catch(_){}
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          try{ b.el.classList.add("coin-fade"); }catch(_){}
+        });
+      });
+
+      setTimeout(() => removeCoinBody(b), 1100);
+    }
+    return targets.length;
+  }
+
+  
+  function liveCoinCount(){
+    return coinBodies.filter(b => b && !b.fading).length;
+  }
+
+  function pruneCoinsToMax(delayMs=0){
+    const anim = settings?.animations || {};
+    const max = Math.max(0, Number(anim.max_coins ?? 35));
+    if (!isFinite(max) || max <= 0) return;
+
+    const doPrune = () => {
+      const live = liveCoinCount();
+      const overflow = live - max;
+      if (overflow <= 0) return;
+
+      // Try hard not to insta-fade coins created in the same burst; if we still overflow,
+      // we'll catch it on the next pass.
+      const faded = fadeOldestCoins(overflow, 140);
+      if (faded < overflow){
+        // Still too many (all coins are very fresh) — prune again shortly.
+        scheduleCoinPrune(160);
+      }
+    };
+
+    if (delayMs > 0){
+      scheduleCoinPrune(delayMs);
+      return;
+    }
+    doPrune();
+  }
+
+  function scheduleCoinPrune(delayMs=0){
+    // Coalesce multiple prune requests into a single pass.
+    if (coinPruneTimer) return;
+    coinPruneTimer = window.setTimeout(() => {
+      coinPruneTimer = 0;
+      // Use RAF so the browser has a chance to paint opacity=1 before we fade to 0.
+      if (coinPruneRaf) return;
+      coinPruneRaf = requestAnimationFrame(() => {
+        coinPruneRaf = 0;
+        pruneCoinsToMax(0);
+      });
+    }, Math.max(0, delayMs));
+  }
+
+  function ensureCoinCapacity(incoming){
+    // Soft max: prefer fading older *existing* coins to make room for a burst.
+    const anim = settings?.animations || {};
+    const max = Math.max(0, Number(anim.max_coins ?? 35));
+    if (!isFinite(max) || max <= 0) return;
+
+    const live = liveCoinCount();
+    const overflow = (live + Math.max(0, incoming|0)) - max;
+    if (overflow <= 0) return;
+
+    // First, fade as many existing coins as we can (these are definitely already painted).
+    const fadeNow = Math.min(live, overflow);
+    if (fadeNow > 0){
+      fadeOldestCoins(fadeNow, 0);
+    }
+
+    // If the burst itself exceeds the cap, allow it briefly, then prune down smoothly.
+    const remaining = overflow - fadeNow;
+    if (remaining > 0){
+      scheduleCoinPrune(140);
+    }
+  }
+
+function updateCoinPhysicsConfig(){
+    // If physics got turned off, fade existing physics coins so we don't leave a frozen pile.
+    const on = !!(settings?.animations?.coin_physics);
+    if (!on && coinBodies.length){
+      fadeOldestCoins(coinBodies.filter(b => !b.fading).length);
+    }
+    if (on && coinBodies.length){
+      startCoinLoop();
+    }
+  }
+
+  function startCoinLoop(){
+    if (coinRaf || !coinBodies.length) return;
+    coinLastT = performance.now();
+    const tick = (now) => {
+      coinRaf = requestAnimationFrame(tick);
+      if (!coinBodies.length){
+        cancelAnimationFrame(coinRaf);
+        coinRaf = 0;
+        return;
+      }
+      stepCoinPhysics(now);
+    };
+    coinRaf = requestAnimationFrame(tick);
+  }
+
+  function stepCoinPhysics(now){
+    const anim = settings?.animations || {};
+    const g = 2400; // px/s^2
+    const restitutionFloor = 0.35;
+    const restitutionCoinMin = 0.12;  // low-speed settling (prevents jitter)
+    const restitutionCoinMax = 0.75;  // high-speed bounce (feels more like the floor hit)
+    const restitutionCoinRef = 520;   // px/s reference speed for blending min→max
+    const airDrag = 0.018;
+
+    let dtRaw = (now - coinLastT) / 1000;
+    coinLastT = now;
+    if (!isFinite(dtRaw)) dtRaw = 0.016;
+    dtRaw = Math.max(0.001, Math.min(0.05, dtRaw));
+
+    // Use at least 2 sub-steps so coin-on-coin impacts don't "squish" and lose bounce.
+    const subSteps = dtRaw > 0.03 ? 3 : 2;
+    const dt = dtRaw / subSteps;
+
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const bottom = h - 13 - 6; // r + pad
+    const top = 13 + 2;
+    const left = 13 + 2;
+    const right = w - 13 - 2;
+
+    for (let s = 0; s < subSteps; s++){
+      // integrate
+      for (const b of coinBodies){
+        if (!b || b.fading) continue;
+        b.touching = false;
+        b.vx *= (1 - airDrag);
+        b.vy = (b.vy + g * dt) * (1 - airDrag * 0.35);
+
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+
+        // angular motion
+        b.angle += b.av * dt;
+        // baseline spin damping + clamp
+        b.av *= 0.985;
+        if (b.av > 10) b.av = 10;
+        else if (b.av < -10) b.av = -10;
+      }
+
+      // boundary collisions
+      for (const b of coinBodies){
+        if (!b || b.fading) continue;
+
+        if (b.x < left){
+          b.x = left;
+          if (b.vx < 0) b.vx = -b.vx * restitutionFloor;
+          b.vy *= 0.98;
+          b.av *= 0.98;
+        }else if (b.x > right){
+          b.x = right;
+          if (b.vx > 0) b.vx = -b.vx * restitutionFloor;
+          b.vy *= 0.98;
+          b.av *= 0.98;
+        }
+
+        if (b.y < top){
+          b.y = top;
+          if (b.vy < 0) b.vy = -b.vy * restitutionFloor;
+        }else if (b.y > bottom){
+          b.y = bottom;
+          if (b.vy > 0) b.vy = -b.vy * restitutionFloor;
+          // floor friction so piles settle instead of ice-skating
+          b.vx *= 0.82;
+          b.touching = true;
+          b.av *= 0.78;
+          if (Math.abs(b.vy) < 45) b.vy = 0;
+          if (Math.abs(b.vx) < 6) b.vx = 0;
+        }
+
+        // mild rolling when on the floor (only while actually moving)
+        if (b.y >= bottom - 0.5){
+          b.touching = true;
+          if (Math.abs(b.vx) > 2) b.av += (b.vx * 0.008);
+        }
+      }
+
+      // circle-circle collisions (N is small; max_coins defaults to 35)
+      for (let i = 0; i < coinBodies.length; i++){
+        const a = coinBodies[i];
+        if (!a || a.fading) continue;
+        for (let j = i + 1; j < coinBodies.length; j++){
+          const b = coinBodies[j];
+          if (!b || b.fading) continue;
+
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const minDist = a.r + b.r;
+          const dist2 = dx*dx + dy*dy;
+          if (dist2 >= (minDist * minDist)) continue;
+
+          const dist = Math.max(0.0001, Math.sqrt(dist2));
+          const nx = dx / dist;
+          const ny = dy / dist;
+          const overlap = (minDist - dist);
+
+
+          // mark as in-contact so we can damp spin when stacked
+          a.touching = true;
+          b.touching = true;
+          // positional correction (separate) with a little slop so contacts don't over-correct and kill bounce
+          const slop = 0.35;   // px
+          const percent = 0.85; // how aggressively to resolve penetration
+          const corr = Math.max(0, overlap - slop) * percent * 0.5;
+          a.x -= nx * corr;
+          a.y -= ny * corr;
+          b.x += nx * corr;
+          b.y += ny * corr;
+
+          // relative velocity
+          const rvx = b.vx - a.vx;
+          const rvy = b.vy - a.vy;
+          const velN = rvx * nx + rvy * ny;
+          if (velN > 0) continue;
+
+          // Make coin-on-coin bounce feel like the floor: more restitution on harder impacts,
+          // but keep it lower on tiny nudges to avoid perpetual jitter.
+          const relN = -velN; // impact speed along the normal (positive)
+          const e = Math.min(
+            restitutionCoinMax,
+            restitutionCoinMin + (restitutionCoinMax - restitutionCoinMin) * Math.min(1, relN / restitutionCoinRef)
+          );
+          const jn = -(1 + e) * velN / 2; // equal mass
+          const impX = jn * nx;
+          const impY = jn * ny;
+
+          a.vx -= impX; a.vy -= impY;
+          b.vx += impX; b.vy += impY;
+
+          // friction impulse along tangent
+          const tx = -ny, ty = nx;
+          const velT = rvx * tx + rvy * ty;
+          let jt = -velT / 2;
+          // Less friction on hard impacts helps the bounce read "springy" instead of "thud".
+          const mu = (relN > 260) ? 0.14 : 0.32;
+          const maxF = mu * jn;
+          jt = Math.max(-maxF, Math.min(maxF, jt));
+
+          const fX = jt * tx;
+          const fY = jt * ty;
+
+          a.vx -= fX; a.vy -= fY;
+          b.vx += fX; b.vy += fY;
+
+          // spin from tangential friction
+          a.av -= jt * 0.06;
+          b.av += jt * 0.06;
+        }
+      }
+      // extra angular damping while in contact so coins don't spin forever in stacks
+      for (const b of coinBodies){
+        if (!b || b.fading) continue;
+        if (b.touching){
+          b.av *= 0.82;
+          if (Math.abs(b.vx) < 3 && Math.abs(b.vy) < 3 && Math.abs(b.av) < 0.35) b.av = 0;
+        }
+      }
+    }
+
+    // render
+    for (const b of coinBodies){
+      if (!b || b.fading) continue;
+      // if the coin is basically sleeping, stop the slow spin creep
+      if (Math.abs(b.vx) < 0.5 && Math.abs(b.vy) < 0.5){
+        b.vx = 0; b.vy = 0;
+        if (Math.abs(b.av) < 0.12) b.av = 0;
+        else b.av *= 0.85;
+      }
+      b.el.style.transform = `translate(${(b.x - b.r).toFixed(2)}px, ${(b.y - b.r).toFixed(2)}px) rotate(${b.angle.toFixed(3)}rad)`;
+    }
+
+    // Respect cap even if user lowers it while coins exist:
+    const max = Math.max(0, Number(anim.max_coins ?? 35));
+    const live = liveCoinCount();
+    if (isFinite(max) && max >= 0 && live > max){
+      scheduleCoinPrune(0);
+    }
+  }
+
+  function dropCoinFromCardCss(card){
     coinCount++;
     const c = document.createElement("div");
     c.className = "coin";
@@ -2590,6 +3036,55 @@ async function loadDevices(){
       coinCount = Math.max(0, coinCount - 1);
     }, t + 250);
   }
+
+  function dropCoinFromCardPhysics(card){
+    const anim = settings?.animations || {};
+    const max = Math.max(0, Number(anim.max_coins ?? 35));
+    if (!isFinite(max) || max <= 0) return;
+
+    coinCount++;
+    const el = document.createElement("div");
+    el.className = "coin coin-phys";
+    el.style.opacity = "1";
+    document.body.appendChild(el);
+
+    const rect = card ? card.getBoundingClientRect() : { left: window.innerWidth/2, top: 120, width: 0, height: 0 };
+    const x = rect.left + Math.min(rect.width - 24, Math.max(24, rect.width * (0.55 + (Math.random()-0.5)*0.5)));
+    const y = rect.top + Math.min(rect.height - 24, Math.max(24, rect.height * 0.55));
+
+    const pop = Math.max(0, Math.min(1200, Number(anim.coin_pop_strength ?? 520)));
+    const vx = ((Math.random() * 2) - 1) * (pop * 0.95);
+    const vy = -(0.55 + Math.random() * 0.7) * pop;
+
+    const b = {
+      el,
+      x, y,
+      vx,
+      vy,
+      r: 13,
+      angle: Math.random() * Math.PI * 2,
+      av: ((Math.random() * 2) - 1) * 7,
+      birth: performance.now(),
+      fading: false
+    };
+    coinBodies.push(b);
+
+    // immediate render so it doesn't flash at 0,0
+    el.style.transform = `translate(${(b.x - b.r).toFixed(2)}px, ${(b.y - b.r).toFixed(2)}px) rotate(${b.angle.toFixed(3)}rad)`;
+
+    startCoinLoop();
+
+    // If we temporarily exceeded the cap (burst spawn), prune back down smoothly.
+    scheduleCoinPrune(0);
+  }
+
+  function dropCoinFromCard(card){
+    if (settings?.animations?.coin_physics){
+      return dropCoinFromCardPhysics(card);
+    }
+    return dropCoinFromCardCss(card);
+  }
+
 
   // Init
   loadTheme();
