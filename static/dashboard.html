@@ -657,16 +657,20 @@
     .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace; }
 
     /* Mining celebration */
+    :root{
+      --shakeAmp: 2px;
+      --shakeDuration: 280ms;
+    }
     @keyframes cardShake {
       0%, 100% { transform: translateX(0); }
-      20% { transform: translateX(-2px); }
-      40% { transform: translateX(2px); }
-      60% { transform: translateX(-1px); }
-      80% { transform: translateX(1px); }
+      20% { transform: translateX(calc(var(--shakeAmp) * -1)); }
+      40% { transform: translateX(var(--shakeAmp)); }
+      60% { transform: translateX(calc(var(--shakeAmp) * -0.5)); }
+      80% { transform: translateX(calc(var(--shakeAmp) * 0.5)); }
     }
-    .shake{ animation: cardShake 280ms ease-in-out; }
+    .shake{ animation: cardShake var(--shakeDuration) ease-in-out; }
 
-    .coin{
+.coin{
       position: fixed;
       left: var(--x, 50%);
       top: var(--y, 20%);
@@ -1009,6 +1013,20 @@
         </div>
       </div>
 
+
+      <div class="row">
+        <div>
+          <label for="shakeIntensity">Shake intensity (px)</label>
+          <input id="shakeIntensity" type="range" min="0" max="10" step="0.5" />
+          <div class="hint" id="shakeIntensityLabel">–</div>
+        </div>
+        <div>
+          <label for="shakeDuration">Shake duration (ms)</label>
+          <input id="shakeDuration" type="range" min="120" max="900" step="10" />
+          <div class="hint" id="shakeDurationLabel">–</div>
+        </div>
+      </div>
+
       <div class="divider"></div>
 
       <div class="row">
@@ -1196,6 +1214,10 @@ const $ = (id) => document.getElementById(id);
 
   const animEnabled = $("animEnabled");
   const shakeEnabled = $("shakeEnabled");
+  const shakeIntensity = $("shakeIntensity");
+  const shakeIntensityLabel = $("shakeIntensityLabel");
+  const shakeDuration = $("shakeDuration");
+  const shakeDurationLabel = $("shakeDurationLabel");
   const coinEnabled = $("coinEnabled");
   const soundEnabled = $("soundEnabled");
   const soundVol = $("soundVol");
@@ -1290,6 +1312,15 @@ const $ = (id) => document.getElementById(id);
     const t = Math.max(0, Math.min(90, tr));
     document.documentElement.style.setProperty("--cardBgPct", `${Math.max(5, 100 - t)}%`);
     updateHeaderSubtitle();
+  }
+
+
+  function applyAnimationVars(){
+    const anim = settings?.animations || {};
+    const amp = Math.max(0, Math.min(30, Number(anim.shake_intensity_px ?? 2)));
+    const dur = Math.max(80, Math.min(2000, Number(anim.shake_duration_ms ?? 280)));
+    document.documentElement.style.setProperty("--shakeAmp", `${amp}px`);
+    document.documentElement.style.setProperty("--shakeDuration", `${dur}ms`);
   }
 
   function fmtAgo(tsIso){
@@ -1807,6 +1838,16 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     const anim = settings.animations || {};
     animEnabled.value = anim.enabled ? "1" : "0";
     shakeEnabled.value = anim.shake_on_share ? "1" : "0";
+    if (shakeIntensity){
+      const amp = Number(anim.shake_intensity_px ?? 2);
+      shakeIntensity.value = String(amp);
+      if (shakeIntensityLabel) shakeIntensityLabel.textContent = `${fmtNum(amp,1)}px`;
+    }
+    if (shakeDuration){
+      const dur = Number(anim.shake_duration_ms ?? 280);
+      shakeDuration.value = String(dur);
+      if (shakeDurationLabel) shakeDurationLabel.textContent = `${fmtInt(dur)}ms`;
+    }
     coinEnabled.value = anim.coin_drop ? "1" : "0";
     soundEnabled.value = anim.sound_on_share ? "1" : "0";
     soundVol.value = anim.sound_volume ?? 0.35;
@@ -1821,6 +1862,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
     applyGridColumns();
     applyAppearance();
+    applyAnimationVars();
 
     // Load active assets
     await refreshAssets();
@@ -1838,10 +1880,13 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
       max_columns: Number(maxCols.value || 0),
       compact_cards: (String(compactCards.value) === "1"),
       hashrate_unit: String(hashrateUnits?.value || "GH"),
+      hashrate_decimals: Number(hashrateDecimals?.value ?? 2),
       rejected_share_red_threshold_pct: Number(rejRedPct?.value || 1),
       animations: {
         enabled: String(animEnabled.value) === "1",
         shake_on_share: String(shakeEnabled.value) === "1",
+        shake_intensity_px: Number(shakeIntensity?.value ?? 2),
+        shake_duration_ms: Number(shakeDuration?.value ?? 280),
         coin_drop: String(coinEnabled.value) === "1",
         sound_on_share: String(soundEnabled.value) === "1",
         sound_volume: Number(soundVol.value || 0),
@@ -1881,6 +1926,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     themeSelect.value = root.getAttribute("data-theme");
     applyGridColumns();
     applyAppearance();
+    applyAnimationVars();
     restartPolling();
   }
 
@@ -1939,7 +1985,33 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     }
   });
 
-  
+
+  shakeIntensity?.addEventListener("input", () => {
+    if (!settings) return;
+    const v = Number(shakeIntensity.value || 0);
+    settings.animations = settings.animations || {};
+    settings.animations.shake_intensity_px = v;
+    if (shakeIntensityLabel) shakeIntensityLabel.textContent = `${fmtNum(v,1)}px`;
+    applyAnimationVars();
+  });
+  shakeIntensity?.addEventListener("change", async () => {
+    try{ await saveSettings({ animations: collectSettingsFromUI().animations }); }
+    catch(e){ alert("Failed to save: " + e.message); }
+  });
+
+  shakeDuration?.addEventListener("input", () => {
+    if (!settings) return;
+    const v = Number(shakeDuration.value || 0);
+    settings.animations = settings.animations || {};
+    settings.animations.shake_duration_ms = v;
+    if (shakeDurationLabel) shakeDurationLabel.textContent = `${fmtInt(v)}ms`;
+    applyAnimationVars();
+  });
+  shakeDuration?.addEventListener("change", async () => {
+    try{ await saveSettings({ animations: collectSettingsFromUI().animations }); }
+    catch(e){ alert("Failed to save: " + e.message); }
+  });
+
   hashrateUnits?.addEventListener("change", async () => {
     try{ await saveSettings({ hashrate_unit: String(hashrateUnits.value || "GH") }); }
     catch(e){ alert("Failed to save: " + e.message); }
@@ -2385,6 +2457,7 @@ async function loadDevices(){
       const data = await apiJson(`${apiBase}/api/dashboard/status?timeout_s=${encodeURIComponent(timeout)}`);
       const byId = new Map((data.devices || []).map(x => [x.id, x]));
       const holdS = Number(getThresholds().offlineGrace ?? 15);
+      const animQueue = [];
 
       devices = devices.map(d => {
         const upd = byId.get(d.id);
@@ -2412,14 +2485,14 @@ async function loadDevices(){
         };
       });
 
-      // Animations based on sharesAccepted increase (use lastInfo if we're in hold mode)
+      // Animations based on sharesAccepted increase (queue them until AFTER renderCards, since renderCards replaces the DOM)
       for (const d of devices){
         const info = d.info || null;
         const shares = info ? Number(info.sharesAccepted) : NaN;
         const prev = deviceState.get(d.id) || {};
         const prevShares = Number(prev.lastSharesAccepted);
         if (isFinite(shares) && isFinite(prevShares) && shares > prevShares){
-          triggerShareAnimation(d.id, shares - prevShares);
+          animQueue.push({ id: d.id, delta: (shares - prevShares) });
         }
         deviceState.set(d.id, {
           ...prev,
@@ -2429,8 +2502,14 @@ async function loadDevices(){
         });
       }
 
+
+
       renderCards();
       renderReorderList();
+
+      for (const a of animQueue){
+        triggerShareAnimation(a.id, a.delta);
+      }
 
       if (manual) {
         const _t2 = new Date().toLocaleTimeString();
@@ -2458,11 +2537,12 @@ async function loadDevices(){
 
     const card = document.querySelector(`.miner-card[data-id="${deviceId}"]`);
     if (card && anim.shake_on_share){
+      const dur = Math.max(80, Math.min(2000, Number(anim.shake_duration_ms ?? 280)));
       card.classList.remove("shake");
       // force reflow
       void card.offsetWidth;
       card.classList.add("shake");
-      setTimeout(() => card.classList.remove("shake"), 400);
+      setTimeout(() => card.classList.remove("shake"), dur + 120);
     }
 
     if (anim.coin_drop){
