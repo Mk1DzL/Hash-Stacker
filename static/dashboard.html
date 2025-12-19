@@ -697,6 +697,14 @@
       color: rgba(2,6,23,0.65);
       text-shadow: 0 1px 0 rgba(255,255,255,0.25);
     }
+
+    .coin.coin-red{
+      background: radial-gradient(circle at 30% 30%, color-mix(in srgb, var(--danger) 25%, white), var(--danger));
+    }
+    .coin.coin-red::after{
+      color: rgba(2,6,23,0.55);
+      text-shadow: 0 1px 0 rgba(255,255,255,0.22);
+    }
     @keyframes coinDrop {
       0% { opacity:0; transform: translate(-50%,-50%) scale(0.55); }
       10%{ opacity:1; transform: translate(-50%,-70%) scale(1.0); }
@@ -961,6 +969,12 @@
           <label for="hashWarnPct">Hashrate warn (% of 10m)</label>
           <input id="hashWarnPct" type="number" min="0" step="1" />
           <div class="hint">If current hashrate drops below this percent of 10m average, show warn dot.</div>
+        </div>
+
+        <div>
+          <label for="updatedLabelDelay">Updated label delay (seconds)</label>
+          <input id="updatedLabelDelay" type="number" min="0" step="1" />
+          <div class="hint">Show “Updated X ago” only after this many seconds (0 = always).</div>
         </div>
 
         <div>
@@ -1234,6 +1248,7 @@ const $ = (id) => document.getElementById(id);
 
   const offlineGrace = $("offlineGrace");
   const hashWarnPct = $("hashWarnPct");
+  const updatedLabelDelay = $("updatedLabelDelay");
 
   const bgUpload = $("bgUpload");
   const bgList = $("bgList");
@@ -1456,6 +1471,7 @@ const $ = (id) => document.getElementById(id);
       vrmDangerColor: t?.vrm_temp?.danger_color ?? "#ef4444",
       offlineGrace: Number(t?.offline?.grace_s ?? 15),
       hashWarnPct: Number(t?.hashrate?.warn_pct_of_10m ?? 70),
+      updatedLabelDelay: Number(t?.updated_label_delay_s ?? 5),
     };
   }
 
@@ -1615,7 +1631,8 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     const seenText = (() => {
       if (!online) return `Offline • last seen ${fmtAgo(lastSeen)}`;
       const s = agoSeconds(lastPoll);
-      return (s != null && s > 0) ? `Updated ${fmtAgo(lastPoll)}` : "";
+      const showAfter = Math.max(0, Number(th().updatedLabelDelay ?? 5));
+      return (s != null && s >= showAfter) ? `Updated ${fmtAgo(lastPoll)}` : "";
     })();
 
     const bestDiffText = bestDiff != null ? `<span class="tag"><span class="k">Best</span> <strong>${fmtSI(bestDiff)}</strong></span>` : "";
@@ -1670,6 +1687,20 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
   }
 
   function th(){ return getThresholds(); }
+
+  function getSharesAccepted(info){
+    if (!info) return NaN;
+    const v = (info.sharesAccepted ?? info.shares_accepted ?? info.shares ?? info.accepted);
+    const n = Number(v);
+    return isFinite(n) ? n : NaN;
+  }
+
+  function getSharesRejected(info){
+    if (!info) return NaN;
+    const v = (info.sharesRejected ?? info.shares_rejected ?? info.rejected);
+    const n = Number(v);
+    return isFinite(n) ? n : NaN;
+  }
 
   let cardDelegationInstalled = false;
 
@@ -1904,6 +1935,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
     offlineGrace.value = t.offlineGrace;
     hashWarnPct.value = t.hashWarnPct;
+    if (updatedLabelDelay) updatedLabelDelay.value = t.updatedLabelDelay;
 
     const anim = settings.animations || {};
     animEnabled.value = anim.enabled ? "1" : "0";
@@ -1993,6 +2025,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
         },
         offline: { grace_s: Number(offlineGrace.value || 15) },
         hashrate: { warn_pct_of_10m: Number(hashWarnPct.value || 70) },
+        updated_label_delay_s: Number(updatedLabelDelay?.value || 5),
       }
     };
     return out;
@@ -2592,18 +2625,27 @@ async function loadDevices(){
         };
       });
 
-      // Animations based on sharesAccepted increase (queue them until AFTER renderCards, since renderCards replaces the DOM)
+      // Animations based on shares accepted/rejected increases (queue them until AFTER renderCards, since renderCards replaces the DOM)
       for (const d of devices){
         const info = d.info || null;
-        const shares = info ? Number(info.sharesAccepted) : NaN;
+        const acc = getSharesAccepted(info);
+        const rej = getSharesRejected(info);
+
         const prev = deviceState.get(d.id) || {};
-        const prevShares = Number(prev.lastSharesAccepted);
-        if (isFinite(shares) && isFinite(prevShares) && shares > prevShares){
-          animQueue.push({ id: d.id, delta: (shares - prevShares) });
+        const prevAcc = Number(prev.lastSharesAccepted);
+        const prevRej = Number(prev.lastSharesRejected);
+
+        if (isFinite(acc) && isFinite(prevAcc) && acc > prevAcc){
+          animQueue.push({ id: d.id, delta: (acc - prevAcc), kind: "accepted" });
         }
+        if (isFinite(rej) && isFinite(prevRej) && rej > prevRej){
+          animQueue.push({ id: d.id, delta: (rej - prevRej), kind: "rejected" });
+        }
+
         deviceState.set(d.id, {
           ...prev,
-          lastSharesAccepted: isFinite(shares) ? shares : prevShares,
+          lastSharesAccepted: isFinite(acc) ? acc : prevAcc,
+          lastSharesRejected: isFinite(rej) ? rej : prevRej,
           lastSeenMs: d.last_seen ? Date.parse(d.last_seen) : prev.lastSeenMs,
           lastInfo: info || prev.lastInfo
         });
@@ -2615,7 +2657,7 @@ async function loadDevices(){
       renderReorderList();
 
       for (const a of animQueue){
-        triggerShareAnimation(a.id, a.delta);
+        triggerShareAnimation(a.id, a.delta, a.kind);
       }
 
       if (manual) {
@@ -2638,7 +2680,7 @@ async function loadDevices(){
     applyGridColumns();
   }
 
-  function triggerShareAnimation(deviceId, delta){
+  function triggerShareAnimation(deviceId, delta, kind="accepted"){
     const anim = settings?.animations || {};
     if (!anim.enabled) return;
 
@@ -2663,7 +2705,7 @@ async function loadDevices(){
 		// Physics mode: spawn immediately; if we exceed the cap during a burst, we prune smoothly after.
         //ensureCoinCapacity(coinsToDrop); Removed - can re-add if persistent overflow ends up being drastic.
         for (let i=0;i<coinsToDrop;i++){
-          dropCoinFromCard(card);
+          dropCoinFromCard(card, kind);
         }
         // If the burst itself exceeded the cap, we'll prune down smoothly after a frame.
         scheduleCoinPrune(0);
@@ -2671,7 +2713,7 @@ async function loadDevices(){
         // Classic mode: hard cap by count.
         for (let i=0;i<coinsToDrop;i++){
           if (coinCount >= max) break;
-          dropCoinFromCard(card);
+          dropCoinFromCard(card, kind);
         }
       }
     }
@@ -3018,10 +3060,10 @@ function updateCoinPhysicsConfig(){
     }
   }
 
-  function dropCoinFromCardCss(card){
+  function dropCoinFromCardCss(card, kind="accepted"){
     coinCount++;
     const c = document.createElement("div");
-    c.className = "coin";
+    c.className = (kind === "rejected") ? "coin coin-red" : "coin";
     const rect = card ? card.getBoundingClientRect() : { left: window.innerWidth/2, top: 120, width: 0, height: 0 };
     const x = rect.left + Math.min(rect.width - 24, Math.max(24, rect.width * (0.55 + (Math.random()-0.5)*0.5)));
     const y = rect.top + Math.min(rect.height - 24, Math.max(24, rect.height * 0.55));
@@ -3037,14 +3079,14 @@ function updateCoinPhysicsConfig(){
     }, t + 250);
   }
 
-  function dropCoinFromCardPhysics(card){
+  function dropCoinFromCardPhysics(card, kind="accepted"){
     const anim = settings?.animations || {};
     const max = Math.max(0, Number(anim.max_coins ?? 35));
     if (!isFinite(max) || max <= 0) return;
 
     coinCount++;
     const el = document.createElement("div");
-    el.className = "coin coin-phys";
+    el.className = (kind === "rejected") ? "coin coin-phys coin-red" : "coin coin-phys";
     el.style.opacity = "1";
     document.body.appendChild(el);
 
@@ -3078,11 +3120,11 @@ function updateCoinPhysicsConfig(){
     scheduleCoinPrune(0);
   }
 
-  function dropCoinFromCard(card){
+  function dropCoinFromCard(card, kind="accepted"){
     if (settings?.animations?.coin_physics){
-      return dropCoinFromCardPhysics(card);
+      return dropCoinFromCardPhysics(card, kind);
     }
-    return dropCoinFromCardCss(card);
+    return dropCoinFromCardCss(card, kind);
   }
 
 
