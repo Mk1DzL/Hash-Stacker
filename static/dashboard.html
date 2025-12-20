@@ -861,7 +861,7 @@
         <div>
           <label for="requestTimeout">Request timeout (s)</label>
           <input id="requestTimeout" type="number" min="0.2" step="0.1" />
-          <div class="hint">How long we wait on <span class="mono">/api/system/info</span> before calling it offline.</div>
+          <div class="hint">How long we wait on <span class="mono">/api/system/info</span> (or Avalon cgminer TCP/4028) before calling it offline.</div>
         </div>
       </div>
 
@@ -1177,7 +1177,7 @@
     <div class="modal-header">
       <div>
         <h2 class="modal-title">Scan for systems</h2>
-        <div class="sub">Search a CIDR for miners that respond to <span class="mono">/api/system/info</span>.</div>
+        <div class="sub">Search a CIDR for miners that respond to <span class="mono">/api/system/info</span> (or Avalon cgminer TCP/4028).</div>
       </div>
       <button class="closeX" id="scanClose" title="Close">✕</button>
     </div>
