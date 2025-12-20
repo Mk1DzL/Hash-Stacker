@@ -15,6 +15,7 @@ import hashlib
 import mimetypes
 import sqlite3
 import re
+import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -267,19 +268,318 @@ def _write_device_poll(
     conn.close()
 
 
-def _fetch_system_info(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    url = f"http://{ip}/api/system/info"
+def _cgminer_query(ip: str, command: str, timeout_s: float, port: int = 4028) -> str:
+    """
+    Minimal CGMiner-style API client (Avalon Q exposes this on TCP/4028).
+
+    The protocol is: send ASCII command (no newline required), then read until EOF.
+    Responses are '|' delimited records, where each record is comma-separated.
+    """
+    if not command:
+        raise ValueError("command must be non-empty")
+    data = b""
+    with socket.create_connection((ip, int(port)), timeout=float(timeout_s)) as s:
+        s.settimeout(float(timeout_s))
+        s.sendall(command.encode("utf-8"))
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        while True:
+            try:
+                chunk = s.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+    return data.decode("utf-8", errors="replace")
+
+
+def _parse_cgminer_records(raw: str) -> List[Dict[str, Any]]:
+    """
+    Parse a cgminer API response into a list of dict records.
+    Handles keys that contain spaces (e.g. 'MHS av') as-is.
+    """
+    records: List[Dict[str, Any]] = []
+    for rec in [r.strip() for r in str(raw).strip().split("|") if r.strip()]:
+        tokens = [t for t in rec.split(",") if t != ""]
+        if not tokens:
+            continue
+        d: Dict[str, Any] = {}
+        first = tokens[0]
+        if "=" in first:
+            k, v = first.split("=", 1)
+            d[k] = v
+            d["_record"] = k
+        else:
+            d["_record"] = first
+        for t in tokens[1:]:
+            if "=" in t:
+                k, v = t.split("=", 1)
+                d[k] = v
+            else:
+                # rarely seen, but keep it
+                d.setdefault("_extra", []).append(t)
+        records.append(d)
+    return records
+
+
+_BRACKET_KV_RE = re.compile(r"([A-Za-z0-9_ ]+?)\[(.*?)\]")
+
+
+def _parse_bracket_kvs(blob: str) -> Dict[str, Any]:
+    """
+    Parse Avalon-style '{Key[val] Key2[val2] ...}' blobs found in estats.
+    Normalizes keys by removing spaces (e.g. 'Nonce Mask' -> 'NonceMask').
+    """
+    out: Dict[str, Any] = {}
+
+    def parse_val(v: str) -> Any:
+        s = v.strip()
+        if len(s) >= 2 and ((s[0] == s[-1] == "'") or (s[0] == s[-1] == '"')):
+            s = s[1:-1]
+
+        if s.endswith("%"):
+            try:
+                return float(s[:-1])
+            except Exception:
+                return s
+
+        parts = [p for p in s.split() if p != ""]
+        if len(parts) > 1:
+            # list
+            nums: List[Any] = []
+            ok = True
+            for p in parts:
+                try:
+                    nums.append(int(p))
+                except Exception:
+                    try:
+                        nums.append(float(p))
+                    except Exception:
+                        ok = False
+                        break
+            return nums if ok else s
+
+        # scalar
+        try:
+            return int(s)
+        except Exception:
+            try:
+                return float(s)
+            except Exception:
+                return s
+
+    for m in _BRACKET_KV_RE.finditer(blob or ""):
+        k = (m.group(1) or "").strip().replace(" ", "")
+        v = m.group(2) or ""
+        if not k:
+            continue
+        out[k] = parse_val(v)
+    return out
+
+
+def _extract_brace_content(s: str) -> str:
+    if not s:
+        return ""
+    a = s.find("{")
+    b = s.rfind("}")
+    if a == -1 or b == -1 or b <= a:
+        return ""
+    return s[a + 1 : b]
+
+
+def _to_float(x: Any) -> Optional[float]:
     try:
-        r = requests.get(url, timeout=timeout_s)
-        if r.status_code != 200:
-            return False, None, f"HTTP {r.status_code}"
-        data = r.json()
-        if not isinstance(data, dict) or "deviceModel" not in data:
-            # still accept but mark as suspicious
-            return True, data if isinstance(data, dict) else {"raw": data}, None
-        return True, data, None
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if s.endswith("%"):
+            s = s[:-1]
+        return float(s)
+    except Exception:
+        return None
+
+
+def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Try to query an Avalon Q via its CGMiner API (TCP/4028).
+    Returns (ok, info, err).
+    """
+    try:
+        v_raw = _cgminer_query(ip, "version", timeout_s)
+        s_raw = _cgminer_query(ip, "summary", timeout_s)
+        e_raw = _cgminer_query(ip, "estats", timeout_s)
+
+        v_recs = _parse_cgminer_records(v_raw)
+        s_recs = _parse_cgminer_records(s_raw)
+        e_recs = _parse_cgminer_records(e_raw)
+
+        version = next((r for r in v_recs if r.get("_record") == "VERSION"), {}) or {}
+        summary = next((r for r in s_recs if r.get("_record") == "SUMMARY"), {}) or {}
+        estats = next((r for r in e_recs if r.get("_record") in ("STATS", "STATS=0") or str(r.get("_record")).startswith("STATS")), {}) or {}
+        # estats often uses first token 'STATS=0', which becomes key STATS; keep the whole record
+        if not estats:
+            estats = next((r for r in e_recs if "MM ID0:Summary" in r or "HBinfo" in r), {}) or {}
+
+        # Pull bracket blobs out of estats (MM summary + HB info)
+        mm_blob_val = None
+        hb_blob_val = None
+        for k, val in estats.items():
+            if isinstance(val, str) and "{" in val and "}" in val and ("Summary" in k or "MM" in k):
+                mm_blob_val = val
+            if isinstance(val, str) and "{" in val and "}" in val and k.startswith("HBinfo"):
+                hb_blob_val = val
+
+        mm = _parse_bracket_kvs(_extract_brace_content(mm_blob_val or ""))
+        hb = _parse_bracket_kvs(_extract_brace_content(hb_blob_val or ""))
+
+        # Normalize hashrate (dashboard expects GH/s) 
+        hr_now = _to_float(mm.get("GHSspd"))
+        if hr_now is None:
+            # summary provides MHS; convert MH/s -> GH/s by /1000
+            hr_now = (_to_float(summary.get("MHS 5s")) or _to_float(summary.get("MHS av")))
+            if hr_now is not None:
+                hr_now = hr_now / 1000.0
+
+        hr_1m = _to_float(summary.get("MHS 1m"))
+        hr_10m = _to_float(summary.get("MHS 5m"))
+        hr_1h = _to_float(summary.get("MHS 15m"))
+        if hr_1m is not None:
+            hr_1m = hr_1m / 1000.0
+        if hr_10m is not None:
+            hr_10m = hr_10m / 1000.0
+        if hr_1h is not None:
+            hr_1h = hr_1h / 1000.0
+
+        # Temps + fans (dashboard expects temp/vrTemp/fanspeed/fanrpm/asicTemps) 
+        temp = _to_float(mm.get("TAvg") or mm.get("HBITemp") or mm.get("HBOTemp"))
+        vr_temp = _to_float(mm.get("ITemp"))
+        pid_t = _to_float(mm.get("TarT"))
+        fanspeed = _to_float(mm.get("FanR"))
+        # FanR is already '%' without the percent sign after parsing
+        fan_rpms = [mm.get("Fan1"), mm.get("Fan2"), mm.get("Fan3"), mm.get("Fan4")]
+        fan_rpms_f = [int(x) for x in fan_rpms if isinstance(x, (int, float)) and x > 0]
+        fanrpm = int(sum(fan_rpms_f) / len(fan_rpms_f)) if fan_rpms_f else None
+        asic_temps = hb.get("PVT_T0") if isinstance(hb.get("PVT_T0"), list) else None
+
+        # Electricals: attempt to interpret PS[] (best-effort, fields vary by firmware) 
+        voltage_mv = None
+        current_ma = None
+        power_w = _to_float(mm.get("WU"))  # WU is not watts; keep for raw only
+        ps = mm.get("PS") if isinstance(mm.get("PS"), list) else None
+        if ps and len(ps) >= 5:
+            vin = ps[1]
+            iin = ps[2]
+            pwr = ps[4]
+            if isinstance(vin, (int, float)):
+                # observed values like 1215 (~12.15V * 100); convert to mV
+                voltage_mv = float(vin) * 10.0 if float(vin) < 2000 else float(vin)
+            if isinstance(iin, (int, float)):
+                # usually mA-ish already
+                current_ma = float(iin)
+            if isinstance(pwr, (int, float)):
+                power_w = float(pwr)
+
+        # Version-ish fields / network-y fields (used in details panel) 
+        mac = version.get("MAC") or mm.get("MAC") or None
+        ssid = mm.get("SSID") or None
+        rssi = _to_float(mm.get("RSSI"))
+        uptime_s = _to_float(summary.get("Elapsed") or estats.get("Elapsed"))
+
+        prod = version.get("PROD") or "Avalon"
+        model = version.get("MODEL") or "Q"
+        dev_model = f"{prod} {model}".strip()
+
+        ver = (
+            version.get("LVERSION")
+            or version.get("BVERSION")
+            or mm.get("Ver")
+            or version.get("CGVERSION")
+            or None
+        )
+
+        # Shares / diffs
+        accepted = _to_float(summary.get("Accepted"))
+        rejected = _to_float(summary.get("Rejected"))
+        best_share = summary.get("Best Share") or None
+        found_blocks = _to_float(summary.get("Found Blocks"))
+
+        info: Dict[str, Any] = {
+            "deviceModel": dev_model,
+            "ASICModel": dev_model,
+            "hostip": ip,
+            "hostname": None,  # Avalon doesn't always expose hostname via cgminer API
+            "macAddr": mac,
+            "ssid": ssid,
+            "wifiRSSI": rssi,
+            "wifiStatus": "OK" if (ssid or rssi is not None) else None,
+            "version": ver,
+
+            # dashboard mining fields (GH/s, W, shares) 
+            "hashRate": hr_now,
+            "hashRate_1m": hr_1m,
+            "hashRate_10m": hr_10m,
+            "hashRate_1h": hr_1h,
+            "power": power_w,
+            "sharesAccepted": accepted,
+            "sharesRejected": rejected,
+            "bestSessionDiff": best_share,
+            "foundBlocks": found_blocks,
+
+            # thermals/electrical 
+            "temp": temp,
+            "vrTemp": vr_temp,
+            "pidTargetTemp": pid_t,
+            "fanspeed": fanspeed,
+            "fanrpm": fanrpm,
+            "asicTemps": asic_temps,
+            "voltage": voltage_mv,
+            "current": current_ma,
+        }
+
+        # keep raw for troubleshooting in details drawer
+        info["avalon_raw"] = {
+            "version": version,
+            "summary": summary,
+            "estats": estats,
+            "mm": mm,
+            "hb": hb,
+        }
+
+        return True, info, None
     except Exception as e:
         return False, None, str(e)
+
+
+def _fetch_system_info(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Primary probe for our dashboard devices:
+      1) Try our normal HTTP endpoint: http://<ip>/api/system/info
+      2) If that fails, fall back to Avalon Q CGMiner API on TCP/4028 (version/summary/estats)
+    """
+    url = f"http://{ip}/api/system/info"
+    http_err: Optional[str] = None
+    try:
+        r = requests.get(url, timeout=timeout_s)
+        if r.status_code == 200:
+                                                       
+            data = r.json()
+            if not isinstance(data, dict):
+                                                 
+                return True, {"raw": data}, None
+            return True, data, None
+        http_err = f"HTTP {r.status_code}"
+    except Exception as e:
+        http_err = str(e)
+
+    ok, info, err = _poll_avalon_q(ip, timeout_s)
+    if ok:
+        return True, info, None
+    return False, None, err or http_err
 
 
 @router.get("/settings")
