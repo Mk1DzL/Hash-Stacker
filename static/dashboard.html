@@ -162,6 +162,30 @@
     }
     .toolbar .btn{ font-size:0.82rem; padding:0.4rem 0.75rem; }
 
+    .oddsPill{
+      display:flex;
+      align-items:center;
+      gap:0.45rem;
+      padding:0.32rem 0.55rem;
+      border:1px solid var(--line);
+      border-radius:999px;
+      background: rgba(255,255,255,0.03);
+      font-size:0.78rem;
+      user-select:none;
+    }
+    .oddsPill .label{ color:var(--muted); font-weight:700; letter-spacing:0.01em; }
+    .oddsPill .value{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .miniSelect{
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0.18rem 0.45rem;
+      font-size: 0.78rem;
+      outline: none;
+    }
+    .miniSelect option{ color:#111827; }
+
     .grid{
       display:grid;
       gap:0.8rem;
@@ -524,6 +548,15 @@
       line-height: 1.35;
     }
     .settings-footer strong{ color: var(--fg); }
+	
+	.toolbar select.oddsSelect{
+	  width: auto;          /* this is the big one */
+	  flex: 0 0 auto;       /* don’t grow */
+	  padding: 0.22rem 0.5rem;
+	  font-size: 0.78rem;
+	  border-radius: 999px;
+	  line-height: 1.1;
+	}
 
     .asset-grid{
       display:grid;
@@ -748,6 +781,16 @@
         <div class="sub">Live status for NerdQAxe / Bitaxe-style miners</div>
       </div>
       <div class="toolbar">
+        <div class="oddsPill" id="blockOddsPill" title="Chance of finding ≥1 Bitcoin block in the selected timescale.">
+          <span class="label">Block odds</span>
+          <span class="value" id="blockOddsValue">—</span>
+          <select id="blockOddsScale" class="oddsSelect" title="Timescale">
+            <option value="hour">per hour</option>
+            <option value="day">per day</option>
+            <option value="month">per month</option>
+            <option value="year">per year</option>
+          </select>
+        </div>
         <a class="btn secondary" href="index.html" title="Back to benchmark">Benchmark</a>
         <button class="btn secondary" id="refreshBtn" title="Poll now">Refresh</button>
         <button class="btn secondary" id="settingsBtn" title="Settings">Settings</button>
@@ -1200,6 +1243,9 @@ const $ = (id) => document.getElementById(id);
   const themeToggle = $("themeToggle");
   const settingsBtn = $("settingsBtn");
   const refreshBtn = $("refreshBtn");
+  const blockOddsPill = $("blockOddsPill");
+  const blockOddsValue = $("blockOddsValue");
+  const blockOddsScale = $("blockOddsScale");
   const scanBtn = $("scanBtn");
   const addBtn = $("addBtn");
   const addIp = $("addIp");
@@ -1373,6 +1419,7 @@ const $ = (id) => document.getElementById(id);
     const t = Math.max(0, Math.min(90, tr));
     document.documentElement.style.setProperty("--cardBgPct", `${Math.max(5, 100 - t)}%`);
     updateHeaderSubtitle();
+    updateBlockOdds();
   }
 
 
@@ -1916,6 +1963,8 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     requestTimeout.value = settings.request_timeout_s ?? 1.2;
     scanCidr.value = settings.scan_default_cidr ?? "192.168.1.0/24";
 
+    if (blockOddsScale) blockOddsScale.value = String(settings.block_odds_timescale || "day");
+
     maxCols.value = settings.max_columns ?? 0;
     compactCards.value = settings.compact_cards ? "1" : "0";
     if (hashrateUnits) hashrateUnits.value = String(settings.hashrate_unit || "GH");
@@ -2162,6 +2211,14 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     catch(e){ alert("Failed to save: " + e.message); }
   });
 
+  blockOddsScale?.addEventListener("change", async () => {
+    if (!settings) return;
+    const v = String(blockOddsScale.value || "day");
+    settings.block_odds_timescale = v;
+    updateBlockOdds(true);
+    try{ await saveSettings({ block_odds_timescale: v }); }catch(_){ }
+  });
+
   rejRedPct?.addEventListener("change", async () => {
     try{ await saveSettings({ rejected_share_red_threshold_pct: Number(rejRedPct.value || 1) }); }
     catch(e){ alert("Failed to save: " + e.message); }
@@ -2220,6 +2277,227 @@ async function loadDevices(){
     updateSummaryLine();
   }
 
+
+  // ---- Bitcoin block odds (Poisson over expected hashes-per-block) ----
+  function secondsForScale(scale){
+    switch(String(scale||"day")){
+      case "hour": return 3600;
+      case "day": return 86400;
+      case "month": return 30 * 86400;
+      case "year": return 365.25 * 86400;
+      default: return 86400;
+    }
+  }
+
+  function fmtCompact(n){
+    const x = Number(n);
+    if (!isFinite(x)) return "∞";
+    const abs = Math.abs(x);
+    if (abs >= 1e12) return (x/1e12).toFixed(2) + "T";
+    if (abs >= 1e9) return (x/1e9).toFixed(2) + "B";
+    if (abs >= 1e6) return (x/1e6).toFixed(2) + "M";
+    if (abs >= 1e3) return (x/1e3).toFixed(2) + "k";
+    return fmtInt(x);
+  }
+  
+  function fmtDifficultyNice(n, digits=2){
+    const x = Number(n);
+    if (!isFinite(x)) return "–";
+    const abs = Math.abs(x);
+
+    // Difficulty is usually in the trillions, so "T" is the common case.
+    const units = [["E",1e18],["P",1e15],["T",1e12],["G",1e9],["M",1e6],["k",1e3]];
+    for (const [suf, v] of units){
+      if (abs >= v){
+        return (x / v).toFixed(digits) + " " + suf;
+      }
+    }
+    return fmtInt(x);
+  }
+
+
+  function fmtDurationHuman(sec){
+    const s = Number(sec);
+    if (!isFinite(s) || s <= 0) return "–";
+    const year = 365.25 * 86400;
+    const day = 86400;
+    if (s >= year) return (s/year).toFixed(1) + "y";
+    if (s >= 30*day) return (s/(30*day)).toFixed(1) + "mo";
+    if (s >= day) return (s/day).toFixed(1) + "d";
+    if (s >= 3600) return (s/3600).toFixed(1) + "h";
+    if (s >= 60) return (s/60).toFixed(1) + "m";
+    return Math.round(s) + "s";
+  }
+
+  function getTotalHashrateGh(){
+    let totalGh = 0;
+    for (const d of devices){
+      if (!d?.online) continue;
+      const hr = Number(d?.info?.hashRate);
+      if (isFinite(hr) && hr > 0) totalGh += hr;
+    }
+    return totalGh;
+  }
+
+  function getDifficultyFromDevices(){
+    // Bitaxe Gamma exposes 'networkDifficulty'. If multiple devices report it, pick the newest.
+    let best = null;
+    let bestTs = 0;
+    for (const d of devices){
+      const info = d?.info;
+      if (!info) continue;
+      const diff = Number(info.networkDifficulty ?? info.difficulty);
+      if (!isFinite(diff) || diff <= 0) continue;
+      const tsIso = d.last_poll || d.last_seen || "";
+      const ts = tsIso ? Date.parse(tsIso) : 0;
+      if (!best || ts >= bestTs){
+        best = diff;
+        bestTs = ts;
+      }
+    }
+    return best;
+  }
+
+  let _difficultyCache = { difficulty: null, source: null, fetchedAt: 0 };
+
+  async function fetchDifficultyFallback(){
+    // backend handles caching + public API fallback
+    const now = Date.now();
+    if (_difficultyCache.difficulty && (now - _difficultyCache.fetchedAt) < 5*60*1000){
+      return _difficultyCache;
+    }
+    try{
+      const d = await apiJson(`${apiBase}/api/dashboard/network/difficulty`);
+      if (d && d.difficulty){
+        _difficultyCache = { difficulty: Number(d.difficulty), source: d.source || "api", fetchedAt: now, as_of: d.as_of };
+        return _difficultyCache;
+      }
+    }catch(_){}
+    return { difficulty: null, source: null, fetchedAt: now };
+  }
+  
+  // --- Block odds throttling / caching ---
+  const BLOCK_ODDS_MIN_INTERVAL_MS = 60_000;     // 1 minute
+  const BLOCK_ODDS_MAJOR_HR_PCT = 0.10;          // 10% change
+  const BLOCK_ODDS_MAJOR_HR_ABS_GH = 500;         // or >= 500 GH/s absolute
+
+  let _blockOddsLast = {
+    at: 0,
+    scale: "day",
+    totalGh: 0,
+    diff: 0,
+    source: "",
+    p: 0,
+    meanTimeS: 0
+  };
+
+  let _blockOddsBusy = false;
+
+
+  async function updateBlockOdds(force=false){
+    if (!blockOddsValue || !blockOddsPill) return;
+  
+    const scale = (settings?.block_odds_timescale) || (blockOddsScale?.value) || "day";
+    if (blockOddsScale) blockOddsScale.value = String(scale);
+  
+    const totalGh = getTotalHashrateGh();
+    if (!(totalGh > 0)){
+      blockOddsValue.textContent = "—";
+      blockOddsPill.title = "Need online miners (hashrate)";
+      // also reset cache so we recompute immediately when miners return
+      _blockOddsLast.at = 0;
+      return;
+    }
+  
+    const now = Date.now();
+    const last = _blockOddsLast;
+  
+    const hrDeltaAbs = Math.abs(totalGh - (last.totalGh || 0));
+    const hrDeltaPct = (last.totalGh > 0) ? (hrDeltaAbs / last.totalGh) : Infinity;
+  
+    const majorHashChange =
+      (hrDeltaAbs >= BLOCK_ODDS_MAJOR_HR_ABS_GH) ||
+      (hrDeltaPct >= BLOCK_ODDS_MAJOR_HR_PCT);
+  
+    const timeDue = !last.at || ((now - last.at) >= BLOCK_ODDS_MIN_INTERVAL_MS);
+    const scaleChanged = (String(last.scale) !== String(scale));
+  
+    const shouldRecalc = !!force || scaleChanged || timeDue || majorHashChange || !(last.diff > 0);
+  
+    if (shouldRecalc && !_blockOddsBusy){
+      _blockOddsBusy = true;
+      try{
+        // Difficulty: devices first, then backend fallback.
+        let diff = getDifficultyFromDevices();
+        let source = "device";
+  
+        if (!(diff > 0)){
+          const fb = await fetchDifficultyFallback();
+          diff = fb.difficulty;
+          source = fb.source || "api";
+        }
+  
+        if (diff > 0){
+          // Expected hashes per block (Bitcoin wiki definition):
+          // expected_hashes = difficulty * (2^48 / 0xffff)  (≈ difficulty * 2^32)
+          const expectedHashes = diff * (Math.pow(2,48) / 65535);
+          const H = totalGh * 1e9; // GH/s -> H/s
+          const T = secondsForScale(scale);
+          const lambda = (H * T) / expectedHashes;
+          const p = 1 - Math.exp(-lambda);
+          const meanTimeS = expectedHashes / H;
+  
+          _blockOddsLast = {
+            at: now,
+            scale,
+            totalGh,
+            diff,
+            source,
+            p,
+            meanTimeS
+          };
+        }else{
+          // if we *still* can't get diff, keep last calc but show message
+          _blockOddsLast.at = now;
+          _blockOddsLast.scale = scale;
+        }
+      }finally{
+        _blockOddsBusy = false;
+      }
+    }
+  
+    // ---- Render (cheap) using cached values ----
+    const use = _blockOddsLast;
+  
+    if (!(use.diff > 0)){
+      blockOddsValue.textContent = "need diff";
+      blockOddsPill.title = "Could not determine network difficulty";
+      return;
+    }
+  
+    const p = use.p;
+    const oneIn = (p > 0) ? (1 / p) : Infinity;
+  
+    blockOddsValue.textContent = `1 in ${fmtCompact(oneIn)}`;
+  
+    const pct = (p * 100);
+    const pctTxt = (pct < 0.001) ? pct.toPrecision(2) : pct.toFixed(3);
+  
+    // Respect GH/s vs TH/s settings for the tooltip total:
+    const totalTxt = formatHashrate(use.totalGh);
+  
+    // Nicer difficulty formatting: "148.20 T"
+    const diffTxt = fmtDifficultyNice(use.diff, 2);
+  
+    blockOddsPill.title =
+      `Chance ≥1 block /${use.scale}: ${pctTxt}%` +
+      ` • mean time: ${fmtDurationHuman(use.meanTimeS)}` +
+      ` • total: ${totalTxt}` +
+      ` • diff: ${diffTxt} (${use.source})`;
+  }
+
+
+
   function updateSummaryLine(){
     const online = devices.filter(d => d.online).length;
     const total = devices.length;
@@ -2230,6 +2508,7 @@ async function loadDevices(){
       : `Last refresh: ${_t} • interval ${fmtInt(settings?.refresh_interval_ms)} ms`;
     statusSub.textContent = lastRefreshText;
     updateHeaderSubtitle();
+    updateBlockOdds();
 }
 
   async function addDevice(){
