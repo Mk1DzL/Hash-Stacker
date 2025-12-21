@@ -16,6 +16,7 @@ import mimetypes
 import sqlite3
 import re
 import socket
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -27,6 +28,13 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 ASSET_ROOT = os.path.join("data", "dashboard_assets")
 BG_DIR = os.path.join(ASSET_ROOT, "backgrounds")
 SND_DIR = os.path.join(ASSET_ROOT, "sounds")
+
+BUILTIN_ASSET_ROOT = "builtin_assets"
+# map kind -> (builtin_subdir, data_dir)
+BUILTIN_KIND_DIRS = {
+    "background": ("backgrounds", BG_DIR),
+    "sound": ("sounds", SND_DIR),
+}
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "refresh_interval_ms": 5000,
@@ -147,10 +155,82 @@ def _ensure_tables() -> None:
     conn.commit()
     conn.close()
 
+def _seed_builtin_assets() -> None:
+    """
+    Copy any files from builtin_assets/{sounds,backgrounds} into the corresponding
+    data/dashboard_assets/{sounds,backgrounds} folder, and register them in dashboard_assets.
+    Safe to run multiple times.
+    """
+    _ensure_dirs()  # ensures BG_DIR / SND_DIR exist :contentReference[oaicite:7]{index=7}
+
+    conn = db._get_conn()
+    cur = conn.cursor()
+
+    for kind, (subdir, out_dir) in BUILTIN_KIND_DIRS.items():
+        src_dir = os.path.join(BUILTIN_ASSET_ROOT, subdir)
+        if not os.path.isdir(src_dir):
+            continue
+
+        seeded_ids: list[int] = []
+
+        for name in sorted(os.listdir(src_dir)):
+            if name.startswith("."):
+                continue
+            src_path = os.path.join(src_dir, name)
+            if not os.path.isfile(src_path):
+                continue
+
+            # Keep a stable filename in data/ (nice for humans + deterministic seeding)
+            safe_name = os.path.basename(name).replace(" ", "_")
+            dst_path = os.path.join(out_dir, safe_name)
+
+            # Copy only if missing (don't clobber user-modified versions)
+            if not os.path.exists(dst_path):
+                os.makedirs(out_dir, exist_ok=True)
+                shutil.copyfile(src_path, dst_path)
+
+            # Register in DB if missing
+            mime = mimetypes.guess_type(dst_path)[0] or ("audio/wav" if kind == "sound" else "application/octet-stream")
+            size = os.path.getsize(dst_path)
+
+            # avoid duplicates by (kind, filename) or (kind, orig_name)
+            cur.execute(
+                """
+                SELECT id FROM dashboard_assets
+                WHERE kind=? AND (filename=? OR orig_name=?)
+                LIMIT 1;
+                """,
+                (kind, safe_name, name),
+            )
+            row = cur.fetchone()
+            if row:
+                seeded_ids.append(int(row["id"]))
+                continue
+
+            cur.execute(
+                """
+                INSERT INTO dashboard_assets (kind, filename, orig_name, mime, size_bytes, created_at, active)
+                VALUES (?, ?, ?, ?, ?, ?, 0);
+                """,
+                (kind, safe_name, name, mime, size, _utcnow_iso()),
+            )
+            seeded_ids.append(int(cur.lastrowid))
+
+        # If nothing is active for this kind yet, activate the first seeded one
+        if seeded_ids:
+            cur.execute("SELECT id FROM dashboard_assets WHERE kind=? AND active=1 LIMIT 1;", (kind,))
+            has_active = cur.fetchone() is not None
+            if not has_active:
+                first_id = seeded_ids[0]
+                cur.execute("UPDATE dashboard_assets SET active=0 WHERE kind=?;", (kind,))
+                cur.execute("UPDATE dashboard_assets SET active=1 WHERE id=?;", (first_id,))
+
+    conn.commit()
+    conn.close()
 
 # Ensure tables exist at import time (keeps app.py changes minimal).
 _ensure_tables()
-
+_seed_builtin_assets()
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     """Merge b into a (copy), recursively for dicts."""
