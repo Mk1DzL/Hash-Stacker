@@ -555,7 +555,7 @@ def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, 
         # Nano 3S-style telemetry: fields like OTemp[75], TAvg[80], FanR[21%]
         br = _extract_bracket_fields(
             e_raw,
-            ["ITemp", "OTemp", "TAvg", "TMax", "MTavg", "MTmax", "FanR", "Fan1", "Fan2", "Fan3", "Fan4", "Ver"]
+            ["ITemp", "OTemp", "TAvg", "TMax", "MTavg", "MTmax", "FanR", "Fan1", "Fan2", "Fan3", "Fan4", "Ver", "Power", "Pwr", "PWR", "POW", "Watts", "Watt", "Pout", "POUT", "VIN", "VIn", "Vin", "IIN", "IIn", "Iin", "PS"]
         )
         for k, v in br.items():
             stats.setdefault(k, v)
@@ -588,11 +588,75 @@ def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, 
         chip_temp = _sane_temp(num(stats.get("TAvg") or stats.get("MTavg") or stats.get("HBOTemp") or stats.get("HBITemp")))
         out_temp = _sane_temp(num(stats.get("OTemp") or stats.get("HBOTemp")))
         vrm_temp = _sane_temp(num(stats.get("HBITemp") or stats.get("ITemp")))
-                          
-                                                                 
-                                                                                           
-                                  
-                                        
+
+
+        # power (W): not always emitted as a first-class field, but some firmwares embed it in estats.
+        def _num_from_any(v: Any) -> Optional[float]:
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                return float(v)
+            s = str(v).strip()
+            if not s:
+                return None
+            # strip common unit suffixes
+            s = s.replace("W", "").replace("w", "").replace("V", "").replace("v", "").replace("A", "").replace("a", "")
+            s = s.replace("mV", "").replace("mA", "")
+            # keep first numeric token
+            mm = re.search(r"[-+]?[0-9]*\.?[0-9]+", s)
+            if not mm:
+                return None
+            try:
+                return float(mm.group(0))
+            except Exception:
+                return None
+
+        power_w: Optional[float] = None
+
+        # Avalon embeds power telemetry in PS[...] on some firmwares.
+        # Example: PS[0 0 27440 4 0 3730 131]  -> last value ≈ watts (matches on-device ~130W).
+        if power_w is None:
+            ps = stats.get("PS")
+            if ps is not None:
+                nums = re.findall(r"[-+]?[0-9]*\.?[0-9]+", str(ps))
+                if nums:
+                    try:
+                        w_guess = float(nums[-1])
+                        if 10 <= w_guess <= 500:
+                            power_w = w_guess
+                    except Exception:
+                        pass
+
+        # direct power keys (best case)
+        for k in ("Power", "Pwr", "PWR", "POW", "Watts", "Watt", "Pout", "POUT"):
+            pv = _num_from_any(stats.get(k))
+            if pv is not None and pv > 0:
+                power_w = pv
+                break
+
+        # if we didn't find watts directly, try voltage/current (may be in mV/mA or V/A)
+        if power_w is None:
+            vin = None
+            iin = None
+            for vk in ("VIN", "VIn", "Vin"):
+                vin = _num_from_any(stats.get(vk))
+                if vin is not None:
+                    break
+            for ik in ("IIN", "IIn", "Iin"):
+                iin = _num_from_any(stats.get(ik))
+                if iin is not None:
+                    break
+
+            if vin is not None and iin is not None and vin > 0 and iin > 0:
+                # heuristics: if values look like milli-units, scale down
+                v_volts = vin / 1000.0 if vin > 200 else vin
+                i_amps = iin / 1000.0 if iin > 20 else iin
+                power_w = v_volts * i_amps
+
+
+
+
+
 
         # fan: prefer FanR (percent), fall back to rpm average
                                                  
@@ -696,6 +760,7 @@ def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, 
             "hashRate_1m": hr_1m,
             "hashRate_10m": hr_5m,   # closest cgminer provides
             "hashRate_1h": hr_avg,   # best long-ish signal available
+            "power": power_w,
             "temp": chip_temp,
             "outTemp": out_temp,
             "vrTemp": vrm_temp,
