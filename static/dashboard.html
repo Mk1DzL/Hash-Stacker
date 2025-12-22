@@ -1780,7 +1780,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
         <div class="kv"><span class="k">Hashrate</span><span class="v">${formatHashrate(hr)}</span></div>
         <div class="kv"><span class="k">10m</span><span class="v">${formatHashrate(info && isFinite(Number(info.hashRate_10m)) ? Number(info.hashRate_10m) : NaN)}</span></div>
         <div class="kv"><span class="k">Chip</span>${maybeColorTempSpan(chip, th().chipWarn, th().chipDanger, th().chipWarnColor, th().chipDangerColor)}</div>
-        <div class="kv"><span class="k">${temp2Label}</span>${vrmWithFan}</div>
+        <div class="kv"><span class="k">${temp2Label}</span>${vrmTempHtml}</div>
         <div class="kv"><span class="k">Fan</span><span class="v">${formatFanSpeed(fan)}</span></div>
         <div class="kv"><span class="k">Efficiency</span><span class="v">${eff != null ? fmtNum(eff,2) + " J/TH" : "–"}</span></div>
         <div class="kv"><span class="k">Power</span><span class="v">${isFinite(pwr) ? fmtNum(pwr,1) + " W" : "–"}</span></div>
