@@ -1767,7 +1767,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
         <div class="mini-topline">
           <div class="kv"><span class="k">ASIC</span>${maybeColorTempSpan(chip, th().chipWarn, th().chipDanger, th().chipWarnColor, th().chipDangerColor)}</div>
-          <div class="kv kv-power"><span class="k">${temp2Label}</span>${vrmWithFan}</div>
+          <div class="kv kv-power"><span class="k">${temp2Label}</span>${vrmTempLine}</div>
         </div>
 
         <div class="kv"><span class="k">Fan</span><span class="v">${formatFanSpeed(fan)}</span></div>
