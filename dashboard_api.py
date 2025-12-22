@@ -489,6 +489,32 @@ def _pick_first(sections: List[Dict[str, str]], key: str) -> Optional[Dict[str, 
     return None
 
 
+def _extract_bracket_fields(raw: str, keys: List[str]) -> Dict[str, str]:
+    """Extract fields formatted like Key[Value] from Avalon 'estats' blobs.
+
+    Nano 3S (and some Avalon firmware) embeds many telemetry values inside a large
+    string (often within the MM ID0 field) rather than emitting them as key=value
+    pairs, so the regular cgminer comma/equals parser won't see them.
+    """
+    out: Dict[str, str] = {}
+    if not raw:
+        return out
+    for k in keys:
+        m = re.search(rf"\b{k}\[([^\]]+)\]", raw)
+        if m:
+            out[k] = m.group(1).strip()
+    return out
+
+
+def _sane_temp(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    # Some devices report "missing" temps as absurd values (e.g. -273).
+    if x <= -200:
+        return None
+    return x
+
+
 def _probe_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, str]], Optional[str]]:
     try:
         v_secs = _parse_cgminer_sections(_cgminer_query(ip, "version", timeout_s))
@@ -509,13 +535,31 @@ def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, 
                             
        
     try:
-        v_secs = _parse_cgminer_sections(_cgminer_query(ip, "version", timeout_s))
-        s_secs = _parse_cgminer_sections(_cgminer_query(ip, "summary", timeout_s))
-        e_secs = _parse_cgminer_sections(_cgminer_query(ip, "estats", timeout_s))
+        v_raw = _cgminer_query(ip, "version", timeout_s)
+
+        s_raw = _cgminer_query(ip, "summary", timeout_s)
+
+        e_raw = _cgminer_query(ip, "estats", timeout_s)
+
+
+        v_secs = _parse_cgminer_sections(v_raw)
+
+        s_secs = _parse_cgminer_sections(s_raw)
+
+        e_secs = _parse_cgminer_sections(e_raw)
 
         ver = _pick_first(v_secs, "PROD") or {}
         summ = _pick_first(s_secs, "Elapsed") or {}
         stats = _pick_first(e_secs, "STATS") or {}
+
+        # Nano 3S-style telemetry: fields like OTemp[75], TAvg[80], FanR[21%]
+        br = _extract_bracket_fields(
+            e_raw,
+            ["ITemp", "OTemp", "TAvg", "TMax", "MTavg", "MTmax", "FanR", "Fan1", "Fan2", "Fan3", "Fan4", "Ver"]
+        )
+        for k, v in br.items():
+            stats.setdefault(k, v)
+
 
         # hashrate: cgminer returns MHS (mega-hash/s). Convert to GH/s for dashboard parity.
         def mhs_to_gh(v: Any) -> Optional[float]:
@@ -541,8 +585,9 @@ def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, 
             except Exception:
                 return None
 
-        chip_temp = num(stats.get("TAvg") or stats.get("HBOTemp") or stats.get("HBITemp"))
-        vrm_temp = num(stats.get("HBITemp") or stats.get("ITemp"))
+        chip_temp = _sane_temp(num(stats.get("TAvg") or stats.get("MTavg") or stats.get("HBOTemp") or stats.get("HBITemp")))
+        out_temp = _sane_temp(num(stats.get("OTemp") or stats.get("HBOTemp")))
+        vrm_temp = _sane_temp(num(stats.get("HBITemp") or stats.get("ITemp")))
                           
                                                                  
                                                                                            
@@ -589,9 +634,27 @@ def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, 
                                     
 
         # identity / firmware
-        prod = ver.get("PROD") or "Avalon"
-        model = ver.get("MODEL") or ""
-        device_model = (f"{prod} {model}").strip()
+        prod = (ver.get("PROD") or "Avalon").strip()
+        model = (ver.get("MODEL") or "").strip()
+        # Avoid duplicate names like "Avalon Nano3s Nano3s"
+        if model and (model.lower() == prod.lower() or model.lower() in prod.lower()):
+            device_model = prod
+        else:
+            device_model = (f"{prod} {model}").strip() if model else prod
+
+        # If version response is sparse, try estats Ver[...] (e.g. "Nano3s-25061101_...")
+        if (not device_model or device_model.lower() == "avalon") and stats.get("Ver"):
+            vv = str(stats.get("Ver"))
+            base = vv.split("-", 1)[0].strip()
+            if base:
+                if base.lower().startswith("nano3s"):
+                    device_model = "Avalon Nano 3S"
+                else:
+                    device_model = f"Avalon {base}"
+        # Cosmetic normalization for Nano 3S naming
+        if device_model and device_model.lower() == "avalon nano3s":
+            device_model = "Avalon Nano 3S"
+
         lver = ver.get("LVERSION") or ver.get("CGVERSION") or ""
         mac = ver.get("MAC") or None
                                                                              
@@ -634,6 +697,7 @@ def _poll_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str, 
             "hashRate_10m": hr_5m,   # closest cgminer provides
             "hashRate_1h": hr_avg,   # best long-ish signal available
             "temp": chip_temp,
+            "outTemp": out_temp,
             "vrTemp": vrm_temp,
 
             "fanspeed": fan_pct,
