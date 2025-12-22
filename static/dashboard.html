@@ -1577,6 +1577,23 @@ const $ = (id) => document.getElementById(id);
     };
   }
 
+
+
+function isAvalonInfo(info){
+  const m = String(info?.deviceModel || info?.hostname || "").toLowerCase();
+  return m.includes("avalon") || !!info?._avalon;
+}
+
+// Prefer steadier hashrate signals on devices that provide them (Avalon: 1m average)
+function getPrimaryHashrate(info){
+  if (!info) return NaN;
+  if (isAvalonInfo(info)){
+    const hr1m = Number(info?.hashRate_1m);
+    if (isFinite(hr1m) && hr1m > 0) return hr1m;
+  }
+  return Number(info?.hashRate);
+}
+
   function dotClassFor(info, online, lastSeenIso){
     const th = getThresholds();
 
@@ -1602,7 +1619,7 @@ const $ = (id) => document.getElementById(id);
       else if (vrm >= th.vrmWarn) worst = Math.max(worst, 1);
     }
     // hashrate warn vs 10m
-    const hr = Number(info?.hashRate);
+    const hr = getPrimaryHashrate(info);
     const hr10 = Number(info?.hashRate_10m);
     if (isFinite(hr) && isFinite(hr10) && hr10 > 0){
       const pct = (hr / hr10) * 100;
@@ -1616,7 +1633,7 @@ const $ = (id) => document.getElementById(id);
   }
 
   function efficiencyJTH(info){
-    const hr = Number(info?.hashRate);
+    const hr = getPrimaryHashrate(info);
     const p = Number(info?.power);
     if (!isFinite(hr) || !isFinite(p) || hr <= 0) return null;
     // hashRate is typically GH/s; J/TH = W / TH/s = W / (GH/s / 1000) = 1000*W/GH/s
@@ -1668,7 +1685,7 @@ function maybeColorTempSpan(val, warn, danger, warnColor, dangerColor){
     const lastSeen = dev.last_seen || dev.lastSeen || null;
     const lastPoll = dev.last_poll || dev.lastPoll || null;
 
-    const hr = info ? Number(info.hashRate) : NaN;
+    const hr = info ? getPrimaryHashrate(info) : NaN;
     const chip = info ? Number(info.temp) : NaN;
     const out = info ? Number(info.outTemp) : NaN;
     const vrm = isFinite(out) ? out : (info ? Number(info.vrTemp) : NaN);
@@ -1715,7 +1732,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
         <div class="mini-topline">
           <div class="kv"><span class="k">ASIC</span>${maybeColorTempSpan(chip, th().chipWarn, th().chipDanger, th().chipWarnColor, th().chipDangerColor)}</div>
-          <div class="kv kv-power"><span class="k">VRM</span>${maybeColorTempSpan(vrm, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor)}</div>
+          <div class="kv kv-power"><span class="k">${temp2Label}</span>${maybeColorTempSpan(vrm, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor)}</div>
         </div>
 
         <div class="kv"><span class="k">Fan</span><span class="v">${formatFanSpeed(fan)}</span></div>
@@ -1725,7 +1742,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
         <div class="kv"><span class="k">Hashrate</span><span class="v">${formatHashrate(hr)}</span></div>
         <div class="kv"><span class="k">10m</span><span class="v">${formatHashrate(info && isFinite(Number(info.hashRate_10m)) ? Number(info.hashRate_10m) : NaN)}</span></div>
         <div class="kv"><span class="k">Chip</span>${maybeColorTempSpan(chip, th().chipWarn, th().chipDanger, th().chipWarnColor, th().chipDangerColor)}</div>
-        <div class="kv"><span class="k">VRM</span>${maybeColorTempSpan(vrm, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor)}</div>
+        <div class="kv"><span class="k">${temp2Label}</span>${maybeColorTempSpan(vrm, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor)}</div>
         <div class="kv"><span class="k">Fan</span><span class="v">${formatFanSpeed(fan)}</span></div>
         <div class="kv"><span class="k">Efficiency</span><span class="v">${eff != null ? fmtNum(eff,2) + " J/TH" : "–"}</span></div>
         <div class="kv"><span class="k">Power</span><span class="v">${isFinite(pwr) ? fmtNum(pwr,1) + " W" : "–"}</span></div>
@@ -1926,7 +1943,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
     const mining = info ? `
       <div class="kvgrid">
-        ${kvRow("Hashrate (now)", `<strong>${formatHashrate(Number(info.hashRate))}</strong>`)}
+        ${kvRow("Hashrate (now)", `<strong>${formatHashrate(getPrimaryHashrate(info))}</strong>`)}
         ${kvRow("Hashrate (1m)", `${formatHashrate(Number(info.hashRate_1m))}`)}
         ${kvRow("Hashrate (10m)", `${formatHashrate(Number(info.hashRate_10m))}`)}
         ${kvRow("Hashrate (1h)", `${formatHashrate(Number(info.hashRate_1h))}`)}
@@ -2421,7 +2438,7 @@ async function loadDevices(){
     let totalGh = 0;
     for (const d of devices){
       if (!d?.online) continue;
-      const hr = Number(d?.info?.hashRate);
+      const hr = getPrimaryHashrate(d?.info);
       if (isFinite(hr) && hr > 0) totalGh += hr;
     }
     return totalGh;
