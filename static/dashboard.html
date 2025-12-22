@@ -850,6 +850,17 @@
             <button class="btn secondary shrink" id="scanBtn">Scan LAN</button>
           </div>
         </div>
+        <div class="row" style="margin-top:0.5rem;">
+          <div class="shrink" style="min-width:240px;">
+            <label for="addBraiinsUser">Braiins OS username (optional)</label>
+            <input id="addBraiinsUser" type="text" placeholder="root" />
+            <div class="hint">Override REST auth for this one device. Leave blank to use dashboard settings.</div>
+          </div>
+          <div class="shrink" style="min-width:240px;">
+            <label for="addBraiinsPass">Braiins OS password (optional)</label>
+            <input id="addBraiinsPass" type="password" placeholder="••••••••" />
+          </div>
+        </div>
       </div>
     </section>
 
@@ -899,7 +910,31 @@
           <label for="scanCidr">Default scan CIDR</label>
           <input id="scanCidr" type="text" placeholder="192.168.10.0/24" />
           <div class="hint">Used by “Scan LAN”. (Pro tip: smaller CIDR = faster scan.)</div>
+          <div class="hint" style="margin-top:10px;">Braiins OS note: the dashboard will prefer the REST API when available. Add credentials below if your REST endpoints require login.</div>
         </div>
+        <div>
+          <label for="braiinsUser">Braiins OS username</label>
+          <input id="braiinsUser" type="text" placeholder="root" />
+          <div class="hint">Used for Braiins OS REST API auth. Leave blank to poll via legacy BOSminer PAPI only.</div>
+        </div>
+        <div>
+          <label for="braiinsPass">Braiins OS password</label>
+          <input id="braiinsPass" type="password" placeholder="••••••••" />
+          <div class="hint">Stored in the dashboard settings on this server.</div>
+        </div>
+        <div class="shrink" style="min-width:240px;">
+          <label for="braiinsPreferRest">Braiins OS: prefer REST</label>
+          <select id="braiinsPreferRest">
+            <option value="1">Yes (recommended)</option>
+            <option value="0">No (use PAPI first)</option>
+          </select>
+          <div class="hint">If REST is enabled on the miner, we’ll use it first when scanning & polling.</div>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="row">
         <div class="shrink" style="min-width:240px;">
           <label for="themeSelect">Preferred theme</label>
           <select id="themeSelect">
@@ -1687,9 +1722,12 @@ function maybeColorTempSpan(val, warn, danger, warnColor, dangerColor){
 
     const hr = info ? getPrimaryHashrate(info) : NaN;
     const chip = info ? Number(info.temp) : NaN;
+    const board = info ? Number(info.boardTemp ?? info.board_temp) : NaN;
     const out = info ? Number(info.outTemp) : NaN;
-    const vrm = isFinite(out) ? out : (info ? Number(info.vrTemp) : NaN);
-    const temp2Label = isFinite(out) ? "Out" : "VRM";
+    const vrm = info ? Number(info.vrTemp) : NaN;
+    const inT = info ? Number(info.inTemp ?? info.inputTemp ?? info.ITemp) : NaN;
+    const temp2 = isFinite(board) ? board : (isFinite(out) ? out : (isFinite(vrm) ? vrm : inT));
+    const temp2Label = isFinite(board) ? "Board" : (isFinite(out) ? "Out" : (isFinite(vrm) ? "VRM" : "In"));
     const fan = info ? Number(info.fanspeed ?? info.fanSpeed ?? info.fan_speed ?? info.fan_rpm ?? info.fanRPM ?? info.fanrpm) : NaN;
     const pwr = info ? Number(info.power) : NaN;
     const eff = info ? efficiencyJTH(info) : null;
@@ -1717,7 +1755,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     const compact = !!settings?.compact_cards;
 
     // compact view keeps only the essentials
-    const vrmTempHtml = maybeColorTempSpan(vrm, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor);
+    const vrmTempHtml = maybeColorTempSpan(temp2, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor);
     const fanInline = (isFinite(fan))
       ? `<span class="v muted">•</span><span class="v">${formatFanSpeed(fan)}</span>`
       : ``;
@@ -1732,7 +1770,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
         <div class="mini-topline">
           <div class="kv"><span class="k">ASIC</span>${maybeColorTempSpan(chip, th().chipWarn, th().chipDanger, th().chipWarnColor, th().chipDangerColor)}</div>
-          <div class="kv kv-power"><span class="k">${temp2Label}</span>${maybeColorTempSpan(vrm, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor)}</div>
+          <div class="kv kv-power"><span class="k">${temp2Label}</span>${vrmWithFan}</div>
         </div>
 
         <div class="kv"><span class="k">Fan</span><span class="v">${formatFanSpeed(fan)}</span></div>
@@ -1742,7 +1780,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
         <div class="kv"><span class="k">Hashrate</span><span class="v">${formatHashrate(hr)}</span></div>
         <div class="kv"><span class="k">10m</span><span class="v">${formatHashrate(info && isFinite(Number(info.hashRate_10m)) ? Number(info.hashRate_10m) : NaN)}</span></div>
         <div class="kv"><span class="k">Chip</span>${maybeColorTempSpan(chip, th().chipWarn, th().chipDanger, th().chipWarnColor, th().chipDangerColor)}</div>
-        <div class="kv"><span class="k">${temp2Label}</span>${maybeColorTempSpan(vrm, th().vrmWarn, th().vrmDanger, th().vrmWarnColor, th().vrmDangerColor)}</div>
+        <div class="kv"><span class="k">${temp2Label}</span>${vrmWithFan}</div>
         <div class="kv"><span class="k">Fan</span><span class="v">${formatFanSpeed(fan)}</span></div>
         <div class="kv"><span class="k">Efficiency</span><span class="v">${eff != null ? fmtNum(eff,2) + " J/TH" : "–"}</span></div>
         <div class="kv"><span class="k">Power</span><span class="v">${isFinite(pwr) ? fmtNum(pwr,1) + " W" : "–"}</span></div>
@@ -1961,12 +1999,17 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
       <div class="kvgrid">
         ${kvRow("Chip temp", `<strong>${fmtNum(info.temp,1)} °C</strong>`)}
         ${(() => {
+          const hasBoard = (info?.boardTemp != null && isFinite(Number(info.boardTemp)));
           const hasOut = (info?.outTemp != null && isFinite(Number(info.outTemp)));
           const hasVrm = (info?.vrTemp != null && isFinite(Number(info.vrTemp)));
+          const hasInT = (info?.inTemp != null && isFinite(Number(info.inTemp)));
+          const boardRow = hasBoard ? kvRow("Board temp", `<strong>${fmtNum(info.boardTemp,1)} °C</strong>`) : "";
           const outRow = hasOut ? kvRow("Output temp", `<strong>${fmtNum(info.outTemp,1)} °C</strong>`) : "";
           const vrmRow = hasVrm ? kvRow("VRM temp", `<strong>${fmtNum(info.vrTemp,1)} °C</strong>`) : "";
-          if (hasOut && hasVrm && Math.abs(Number(info.outTemp) - Number(info.vrTemp)) > 0.1) return outRow + vrmRow;
-          return hasOut ? outRow : vrmRow;
+          const inRow = hasInT ? kvRow("Input temp", `<strong>${fmtNum(info.inTemp,1)} °C</strong>`) : "";
+          // If we have both Out and VRM and they differ, show both; otherwise show the one we have.
+          const outVrm = (hasOut && hasVrm && Math.abs(Number(info.outTemp) - Number(info.vrTemp)) > 0.1) ? (outRow + vrmRow) : (hasOut ? outRow : vrmRow);
+          return boardRow + inRow + outVrm;
         })()}
         ${kvRow("PID target", `${fmtNum(info.pidTargetTemp,1)} °C`)}
         ${kvRow("Fan speed", `${fmtInt(info.fanspeed)} %`)}
@@ -2051,6 +2094,10 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
     refreshInterval.value = settings.refresh_interval_ms ?? 5000;
     requestTimeout.value = settings.request_timeout_s ?? 1.2;
     scanCidr.value = settings.scan_default_cidr ?? "192.168.1.0/24";
+
+    if (braiinsUser) braiinsUser.value = settings?.braiins?.rest_username ?? "";
+    if (braiinsPass) braiinsPass.value = settings?.braiins?.rest_password ?? "";
+    if (braiinsPreferRest) braiinsPreferRest.value = (settings?.braiins?.prefer_rest === false) ? "0" : "1";
 
     if (blockOddsScale) blockOddsScale.value = String(settings.block_odds_timescale || "day");
 
@@ -2620,15 +2667,26 @@ async function loadDevices(){
     const ip = addIp.value.trim();
     if (!ip){ alert("Enter an IP."); return; }
     const name = addName.value.trim() || null;
+
+    const cfg = {};
+    const bu = (addBraiinsUser?.value || "").trim();
+    const bp = (addBraiinsPass?.value || "");
+    if (bu || bp) cfg.braiins = { rest_username: bu, rest_password: bp };
+
+    const payload = { ip, name };
+    if (Object.keys(cfg).length) payload.config = cfg;
+
     addBtn.disabled = true;
     try{
       await apiJson(`${apiBase}/api/dashboard/devices`, {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ ip, name }),
+        body: JSON.stringify(payload),
       });
       addIp.value = "";
       addName.value = "";
+      if (addBraiinsUser) addBraiinsUser.value = "";
+      if (addBraiinsPass) addBraiinsPass.value = "";
       await loadDevices();
       await pollOnce();
     }catch(e){
@@ -2636,9 +2694,7 @@ async function loadDevices(){
     }finally{
       addBtn.disabled = false;
     }
-  }
-  addBtn.addEventListener("click", addDevice);
-  addIp.addEventListener("keydown", (e) => { if (e.key === "Enter") addDevice(); });
+  }addIp.addEventListener("keydown", (e) => { if (e.key === "Enter") addDevice(); });
 
   async function removeDevice(id){
     await apiJson(`${apiBase}/api/dashboard/devices/${id}`, { method:"DELETE" });
