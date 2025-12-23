@@ -1099,27 +1099,61 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
 
 
 def _probe_braiins_rest(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    """Detect REST API by calling /api/v1/version over http/https."""
+    """Detect Braiins OS REST API via /api/v1/miner/details over http/https.
+
+    Older versions of this project probed /api/v1/version and treated any 401/403
+    as a positive signal. That can false-positive on non-miner devices.
+
+    /api/v1/miner/details is a Braiins OS specific endpoint (documented in the
+    official OpenAPI spec) and is much less likely to collide.
+    """
     pref_port = int(cfg.get("rest_port") or 80)
     ports = list(dict.fromkeys([pref_port, 80, 443]))
     schemes = ["https", "http"] if cfg.get("rest_scheme") == "https" else ["http", "https"]
     last_err: Optional[str] = None
+
+    def looks_like_bos_details(js: object) -> bool:
+        if not isinstance(js, dict):
+            return False
+        # keys from the OpenAPI sample payload
+        expected = {"bos_version", "bos_mode", "miner_identity", "mac_address", "hostname", "serial_number", "uid"}
+        return any(k in js for k in expected)
+
     for scheme in schemes:
         for port in ports:
-            base = f"{scheme}://{ip}:{port}" if (port and ((scheme == "http" and port != 80) or (scheme == "https" and port != 443))) else f"{scheme}://{ip}"
-            url = base + "/api/v1/version"
+            base = (
+                f"{scheme}://{ip}:{port}"
+                if (port and ((scheme == "http" and port != 80) or (scheme == "https" and port != 443)))
+                else f"{scheme}://{ip}"
+            )
+            url = base + "/api/v1/miner/details"
             try:
                 r = requests.get(url, timeout=timeout_s, verify=False)
-                if r.status_code in (200, 401, 403):
-                    # 200 is ideal; 401/403 still suggests the API exists.
-                    try:
-                        js = r.json()
-                    except Exception:
-                        js = None
-                    return True, {"base_url": base, "scheme": scheme, "port": port, "version": js}, None
+                if r.status_code not in (200, 401, 403):
+                    continue
+
+                js = None
+                try:
+                    js = r.json()
+                except Exception:
+                    js = None
+
+                if r.status_code == 200:
+                    if looks_like_bos_details(js):
+                        return True, {"base_url": base, "scheme": scheme, "port": port, "details": js}, None
+                    # 200 but not the expected shape => not Braiins
+                    continue
+
+                # 401/403: still a good signal, but require at least JSON content-type
+                # or a payload that matches the expected shape.
+                ctype = (r.headers.get("content-type") or "").lower()
+                if looks_like_bos_details(js) or ("json" in ctype):
+                    return True, {"base_url": base, "scheme": scheme, "port": port, "details": js}, None
+
             except Exception as e:
                 last_err = str(e)
                 continue
+
     return False, None, last_err or "no response"
 
 
@@ -1182,6 +1216,8 @@ def _poll_braiins_rest(
         if not base:
             return False, None, "missing base_url"
 
+        details, sc0 = _braiins_get_json(ip, base, "/api/v1/miner/details", cfg, timeout_s)
+
         stats, sc1 = _braiins_get_json(ip, base, "/api/v1/miner/stats", cfg, timeout_s)
         hashboards, sc2 = _braiins_get_json(ip, base, "/api/v1/miner/hw/hashboards", cfg, timeout_s)
         cooling, sc3 = _braiins_get_json(ip, base, "/api/v1/cooling/state", cfg, timeout_s)
@@ -1199,13 +1235,40 @@ def _poll_braiins_rest(
             }
             return True, info, None
 
-        info: Dict[str, Any] = {
-            "type": "Braiins OS (REST)",
-            "deviceModel": "Braiins OS",
-            "hostname": (netinfo or {}).get("hostname"),
-            "rest_base": base,
-            "raw": {"stats": stats, "hashboards": hashboards, "cooling": cooling},
-        }
+        
+        # Prefer identity info from /api/v1/miner/details when available
+        if isinstance(details, dict):
+            hn = details.get("hostname")
+            if hn:
+                info["hostname"] = hn
+
+            # Try to pull a real hardware model (Antminer model, etc.) from miner_identity
+            model = None
+            mid = details.get("miner_identity")
+            if isinstance(mid, dict):
+                # Prefer keys that look like model/name
+                for k in ("model", "hardware_model", "hardwareModel", "name", "type", "variant"):
+                    v = mid.get(k)
+                    if isinstance(v, str) and v.strip():
+                        model = v.strip()
+                        break
+                if model is None:
+                    # fall back to first non-empty string value
+                    for v in mid.values():
+                        if isinstance(v, str) and v.strip():
+                            model = v.strip()
+                            break
+
+            # If we didn't get it from miner_identity, try sticker_hashrate/container fields
+            if model is None:
+                v = details.get("platform")
+                if isinstance(v, (str, int)):
+                    model = str(v)
+
+            if model:
+                info["deviceModel"] = model
+
+            info.setdefault("raw", {}).setdefault("details", details)
 
         # Temperatures: use max highest_chip_temp and board_temp if available
         chip_vals: List[float] = []
@@ -1319,6 +1382,43 @@ def _poll_braiins_rest(
         return False, None, str(e)
 
 
+def _looks_like_http_miner_payload(data: object) -> bool:
+    """Heuristic: True if JSON looks like a supported miner HTTP payload.
+
+    Used to keep LAN scan results from listing random devices that happen to
+    expose JSON endpoints. We require both an identity hint and at least one
+    mining/telemetry metric.
+    """
+    if not isinstance(data, dict):
+        return False
+
+    # Identity hints
+    ident_ok = any(k in data for k in (
+        "deviceModel", "ASICModel", "minerModel", "model", "hwModel", "hardwareModel",
+    ))
+
+    # Telemetry / mining-ish hints
+    metric_ok = any(k in data for k in (
+        "hashRate", "hashrate", "hashRate_1m", "hashRate_10m", "hashRate_1h",
+        "power", "temp", "boardTemp", "chipTemp", "vrmTemp",
+        "fanspeed", "fanrpm",
+        "sharesAccepted", "sharesRejected", "bestDiff", "foundBlocks",
+        "uptimeSeconds", "macAddr",
+    ))
+
+    return bool(ident_ok and metric_ok)
+
+
+def _looks_like_supported_miner(detected: str, info: object) -> bool:
+    """Return True if a (detected, info) pair appears to be a miner we support."""
+    d = (detected or "").strip().lower()
+    if d in ("avalon_cgminer", "bosminer_papi", "braiins_rest"):
+        return True
+    if d in ("http", "bitaxe", "nerdqaxe"):
+        return _looks_like_http_miner_payload(info)
+    return False
+
+
 def _fetch_system_info(
     ip: str,
     timeout_s: float,
@@ -1344,53 +1444,50 @@ def _fetch_system_info(
         ok, info, err = _poll_avalon_q(ip, timeout_s)
         return ok, info, err, "avalon_cgminer"
 
-    # Explicit HTTP polling
+    # Explicit HTTP polling (BitAxe/NerdQAxe style)
     if pt in ("http", "bitaxe", "nerdqaxe"):
         url = f"http://{ip}/api/system/info"
         try:
             r = requests.get(url, timeout=timeout_s)
             r.raise_for_status()
             data = r.json()
-            if not isinstance(data, dict) or "deviceModel" not in data:
-                # still accept but mark as suspicious
-                return True, data if isinstance(data, dict) else {"raw": data}, None, "http"
+            if not _looks_like_http_miner_payload(data):
+                return False, None, "Not a supported miner HTTP API", "http"
             return True, data, None, "http"
         except Exception as e:
             return False, None, str(e), "http"
 
     # Auto-detect:
-    # Prefer Braiins OS REST if it looks available (and settings say so).
+    # 1) Try the most specific protocols first (TCP miners), then REST, then HTTP.
     cfg = _merge_braiins_cfg(device_cfg)
     quick = max(0.15, min(0.45, timeout_s))
 
-    if cfg.get("prefer_rest", True):
-        ok_rest, rest_meta, err_rest = _probe_braiins_rest(ip, quick, cfg)
-        if ok_rest:
-            ok_full, info_r, err_full = _poll_braiins_rest(ip, timeout_s, cfg, rest_meta)
-            return ok_full, info_r, err_full, "braiins_rest"
-    else:
-        err_rest = None
-
-    # Legacy BOSminer/Braiins PAPI (JSON over TCP/4028)
+    # BOSminer/Braiins PAPI (JSON over TCP/4028)
     ok_papi, _meta_p, err_papi = _probe_bosminer_papi(ip, quick, cfg)
     if ok_papi:
         ok_full, info_p, err_full = _poll_bosminer_papi(ip, timeout_s, cfg)
         return ok_full, info_p, err_full, "bosminer_papi"
 
-    # Then try Avalon cgminer (TCP/4028 but cgminer "pipe" protocol)
+    # Avalon cgminer (TCP/4028 pipe protocol)
     ok_probe, _ver, err_a = _probe_avalon_q(ip, quick)
     if ok_probe:
         ok_full, info_a, err_full = _poll_avalon_q(ip, timeout_s)
         return ok_full, info_a, err_full, "avalon_cgminer"
 
-    # Finally try BitAxe-style HTTP with the full timeout
+    # Braiins OS REST (HTTP/HTTPS)
+    ok_rest, rest_meta, err_rest = _probe_braiins_rest(ip, quick, cfg)
+    if ok_rest:
+        ok_full, info_r, err_full = _poll_braiins_rest(ip, timeout_s, cfg, rest_meta)
+        return ok_full, info_r, err_full, "braiins_rest"
+
+    # Finally try BitAxe-style HTTP
     url = f"http://{ip}/api/system/info"
     try:
         r = requests.get(url, timeout=timeout_s)
         r.raise_for_status()
         data = r.json()
-        if not isinstance(data, dict) or "deviceModel" not in data:
-            return True, data if isinstance(data, dict) else {"raw": data}, None, "http"
+        if not _looks_like_http_miner_payload(data):
+            raise RuntimeError("Not a supported miner HTTP API")
         return True, data, None, "http"
     except Exception as e:
         extras = []
@@ -1766,6 +1863,8 @@ def api_scan(payload: ScanPayload):
     def probe(ip: str) -> Optional[Dict[str, Any]]:
         ok, info, err, detected = _fetch_system_info(ip, timeout, poll_type='auto')
         if not ok:
+            return None
+        if not _looks_like_supported_miner(detected, info):
             return None
         # attach a few convenient fields
         if isinstance(info, dict):
