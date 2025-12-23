@@ -952,6 +952,19 @@
           <div class="hint">Hides the top summary + add/scan controls for a cleaner “wall display”.</div>
         </div>
       </div>
+
+      <div class="divider"></div>
+
+      <div class="row" style="align-items:flex-end;">
+        <div>
+          <label>Support & diagnostics</label>
+          <div class="hint">Copies a read-only debug snapshot (no secrets) so we can diagnose DB paths, schema, and polling issues.</div>
+        </div>
+        <div class="shrink" style="min-width:220px;">
+          <label>&nbsp;</label>
+          <button class="btn secondary shrink" id="copyDebugBtn" title="Copy /api/dashboard/debug JSON to clipboard">Copy debug info</button>
+        </div>
+      </div>
     </div>
 
     <div class="panel" id="panel_layout">
@@ -1415,6 +1428,7 @@ const $ = (id) => document.getElementById(id);
 
   const saveSettingsBtn = $("saveSettingsBtn");
   const saveAllBtn = $("saveAllBtn");
+  const copyDebugBtn = $("copyDebugBtn");
 
   // tips footer
   const tipBtcBtn = $("tipBtcBtn");
@@ -2261,6 +2275,56 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
       alert("Saved settings.");
     }catch(e){ alert("Failed to save settings: " + e.message); }
   });
+
+  async function copyDebugInfo(){
+    if (!copyDebugBtn) return;
+    const old = copyDebugBtn.textContent || "Copy debug info";
+    copyDebugBtn.disabled = true;
+    copyDebugBtn.textContent = "Copying…";
+    try{
+      const res = await fetch("/api/dashboard/debug", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const text = JSON.stringify(data, null, 2);
+
+      let copied = false;
+      try{
+        if (navigator.clipboard && window.isSecureContext){
+          await navigator.clipboard.writeText(text);
+          copied = true;
+        }
+      }catch(_){ /* fall through */ }
+
+      if (!copied){
+        // Fallback for non-secure contexts / older browsers
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        ta.style.top = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try{ copied = document.execCommand("copy"); }catch(_){ copied = false; }
+        document.body.removeChild(ta);
+      }
+
+      if (copied){
+        alert("Debug info copied to clipboard.");
+      }else{
+        // Last resort: show a prompt so the user can copy manually
+        prompt("Copy debug info:", text);
+      }
+    }catch(e){
+      alert("Failed to fetch debug info: " + (e?.message || e));
+    }finally{
+      copyDebugBtn.disabled = false;
+      copyDebugBtn.textContent = old;
+    }
+  }
+
+  copyDebugBtn?.addEventListener("click", copyDebugInfo);
 
   function showTip(kind){
     if (!tipAddrBox) return;
