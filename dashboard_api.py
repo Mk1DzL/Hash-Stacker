@@ -1459,7 +1459,7 @@ def _poll_braiins_rest(
                 "rest_base": base,
             }
             # REST auth failure is not a healthy poll; keep identity info so UI can show a clear banner.
-            return False, info, "Authentication required for Braiins OS REST API
+            return False, info, "Authentication required for Braiins OS REST API (HTTP 401/403)"
 
         
         # Prefer identity info from /api/v1/miner/details when available
