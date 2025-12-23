@@ -25,11 +25,15 @@ import db
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
-ASSET_ROOT = os.path.join("data", "dashboard_assets")
+# Resolve all on-disk paths relative to this file (not the process CWD). This
+# avoids accidental "multiple DB/files" situations in Docker/Portainer.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+ASSET_ROOT = os.path.join(_BASE_DIR, "data", "dashboard_assets")
 BG_DIR = os.path.join(ASSET_ROOT, "backgrounds")
 SND_DIR = os.path.join(ASSET_ROOT, "sounds")
 
-BUILTIN_ASSET_ROOT = "builtin_assets"
+BUILTIN_ASSET_ROOT = os.path.join(_BASE_DIR, "builtin_assets")
 # map kind -> (builtin_subdir, data_dir)
 BUILTIN_KIND_DIRS = {
     "background": ("backgrounds", BG_DIR),
@@ -117,7 +121,7 @@ def _ensure_tables() -> None:
             created_at TEXT NOT NULL,
             sort_order INTEGER NOT NULL DEFAULT 0,
             poll_type TEXT NOT NULL DEFAULT 'http',
-            config_json TEXT
+            config_json TEXT,
             last_seen TEXT,
             last_poll TEXT,
             online INTEGER NOT NULL DEFAULT 0,
@@ -127,20 +131,39 @@ def _ensure_tables() -> None:
         """
     )
 
-
     # ---- schema migrations ----
-    # Add poll_type (http / avalon_cgminer / auto) for protocol-aware polling.
-    cur.execute("PRAGMA table_info(dashboard_devices);")
-    cols = {row[1] for row in cur.fetchall()}  # (cid, name, type, notnull, dflt_value, pk)
-    if "poll_type" not in cols:
-        cur.execute("ALTER TABLE dashboard_devices ADD COLUMN poll_type TEXT NOT NULL DEFAULT 'http';")
+    # NOTE: SQLite has no native schema migration support; we keep this safe and
+    # additive (ALTER TABLE ADD COLUMN). This also heals older/broken installs.
+    def _cols() -> set[str]:
+        cur.execute("PRAGMA table_info(dashboard_devices);")
+        return {row[1] for row in cur.fetchall()}  # (cid, name, type, notnull, dflt_value, pk)
 
-    # Add optional per-device config JSON (credentials, ports, etc.)
-    if "config_json" not in cols:
-        cur.execute("ALTER TABLE dashboard_devices ADD COLUMN config_json TEXT;")
+    cols = _cols()
 
-    # normalize any empty values
+    def _add_col(col_name: str, ddl: str) -> None:
+        nonlocal cols
+        if col_name in cols:
+            return
+        cur.execute(ddl)
+        cols = _cols()
+
+    # Protocol-aware polling.
+    _add_col("poll_type", "ALTER TABLE dashboard_devices ADD COLUMN poll_type TEXT NOT NULL DEFAULT 'http';")
+
+    # Optional per-device config JSON (credentials, ports, etc.)
+    _add_col("config_json", "ALTER TABLE dashboard_devices ADD COLUMN config_json TEXT;")
+
+    # Dashboard health/status fields. These are used by the polling loop; if they
+    # are missing, the dashboard can 500 with "no such column".
+    _add_col("last_seen", "ALTER TABLE dashboard_devices ADD COLUMN last_seen TEXT;")
+    _add_col("last_poll", "ALTER TABLE dashboard_devices ADD COLUMN last_poll TEXT;")
+    _add_col("online", "ALTER TABLE dashboard_devices ADD COLUMN online INTEGER NOT NULL DEFAULT 0;")
+    _add_col("last_error", "ALTER TABLE dashboard_devices ADD COLUMN last_error TEXT;")
+    _add_col("last_info_json", "ALTER TABLE dashboard_devices ADD COLUMN last_info_json TEXT;")
+
+    # Normalize any empty values for older installs.
     cur.execute("UPDATE dashboard_devices SET poll_type='http' WHERE poll_type IS NULL OR TRIM(poll_type)='';")
+    cur.execute("UPDATE dashboard_devices SET online=0 WHERE online IS NULL;")
 
     cur.execute(
         """
@@ -1644,6 +1667,72 @@ def api_poll_status(
     results.sort(key=lambda r: order.get(r["id"], (10_000, r["id"])))
 
     return {"now": now, "devices": results}
+
+
+@router.get("/debug")
+def api_debug():
+    """Return a lightweight diagnostic snapshot to help troubleshoot deployments.
+
+    This endpoint is intentionally read-only and avoids returning any secrets.
+    It is safe to share screenshots/output when reporting issues.
+    """
+    info: Dict[str, Any] = {
+        "ok": True,
+        "db_path": getattr(db, "DB_PATH", None),
+        "cwd": os.getcwd(),
+        "base_dir": _BASE_DIR,
+        "asset_root": ASSET_ROOT,
+        "bg_dir": BG_DIR,
+        "snd_dir": SND_DIR,
+    }
+
+    try:
+        conn = db._get_conn()
+        cur = conn.cursor()
+
+        cur.execute("PRAGMA database_list;")
+        info["sqlite_databases"] = [
+            {"seq": r[0], "name": r[1], "file": r[2]} for r in cur.fetchall()
+        ]
+
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        tables = [r[0] if not hasattr(r, "keys") else r["name"] for r in cur.fetchall()]
+        info["tables"] = tables
+
+        def table_info(table: str) -> Dict[str, Any]:
+            out: Dict[str, Any] = {"columns": []}
+            try:
+                cur.execute(f"PRAGMA table_info({table});")
+                cols = []
+                for row in cur.fetchall():
+                    # row = (cid, name, type, notnull, dflt_value, pk)
+                    cols.append(
+                        {
+                            "name": row[1],
+                            "type": row[2],
+                            "notnull": bool(row[3]),
+                            "default": row[4],
+                            "pk": bool(row[5]),
+                        }
+                    )
+                out["columns"] = cols
+                cur.execute(f"SELECT COUNT(*) FROM {table};")
+                out["row_count"] = int(cur.fetchone()[0])
+            except Exception as e:
+                out["error"] = f"{type(e).__name__}: {e}"
+            return out
+
+        # Focus on the tables relevant to the dashboard and benchmarks.
+        for t in ("dashboard_devices", "dashboard_settings", "dashboard_assets", "benchmark_runs", "profiles"):
+            if t in tables:
+                info[t] = table_info(t)
+
+        conn.close()
+    except Exception as e:
+        info["ok"] = False
+        info["error"] = f"{type(e).__name__}: {e}"
+
+    return info
 
 
 class ScanPayload(BaseModel):
