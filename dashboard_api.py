@@ -17,6 +17,9 @@ import sqlite3
 import re
 import socket
 import shutil
+import logging
+logger = logging.getLogger("hash-stacker")
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -1127,9 +1130,8 @@ def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]
                 return True, {"description": desc, "port": port, "probe_cmd": cmd}, None
             last_err = "unexpected response"
         except Exception as e:
-            last_err = str(e)
-
-    return False, None, last_err
+    logger.warning("BOSminer poll failed for %s:%s - %s", ip, port, e)
+    return False, None, str(e)
 
 
 def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
@@ -1144,40 +1146,21 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
     try:
         summary = _bosminer_query(ip, "summary", timeout_s, port=port, req_id=1)
 
-        # Optional rich telemetry (some BOSminer variants don't support these commands)
-        temps: Dict[str, Any] = {}
-        fans: Dict[str, Any] = {}
-        pools: Dict[str, Any] = {}
-        try:
-            temps = _bosminer_query(ip, "temps", timeout_s, port=port, req_id=2)
-        except Exception:
-            temps = {}
-        try:
-            fans = _bosminer_query(ip, "fans", timeout_s, port=port, req_id=3)
-        except Exception:
-            fans = {}
-        try:
-            pools = _bosminer_query(ip, "pools", timeout_s, port=port, req_id=4)
-        except Exception:
-            pools = {}
+# BOSminer/cgminer compatibility:
+# Many Braiins BOSminer builds (incl S19K Pro) do NOT support "temps" / "fans".
+# Use optional queries + devs/pools instead.
+temps = None
+fans = None
 
-        # Summary row selection
-        srow: Any
-        if isinstance(summary.get("SUMMARY"), list) and summary["SUMMARY"]:
-            srow = summary["SUMMARY"][0]
-        elif isinstance(summary.get("SUMMARY"), dict):
-            srow = summary["SUMMARY"]
-        else:
-            srow = summary
+try:
+    pools = _bosminer_query(ip, "pools", timeout_s, port=port, req_id=2)
+except Exception:
+    pools = None
 
-        def _get_rate_gh(keys_gh: List[str], keys_mh: List[str]) -> Optional[float]:
-            gh = _first_number(srow, keys_gh)
-            if gh is not None:
-                return float(gh)
-            mh = _first_number(srow, keys_mh)
-            if mh is not None:
-                return float(mh) / 1000.0
-            return None
+try:
+    devs = _bosminer_query(ip, "devs", timeout_s, port=port, req_id=3)
+except Exception:
+    devs = None
 
         # Hashrate windows (GHS)
         hr_5s = _get_rate_gh(
@@ -1206,11 +1189,24 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
         )
 
         # Backward compatible alias used in some parts of this project
-        hr_gh = hr_5s or hr_avg
+        # Rich BOSminer windowed rates (BOSminer reports MHS; normalize to GH/s)
+mhs_5s  = _first_number(srow, ["mhs 5s", "mhs_5s", "mhs5s"])
+mhs_1m  = _first_number(srow, ["mhs 1m", "mhs_1m"])
+mhs_5m  = _first_number(srow, ["mhs 5m", "mhs_5m"])
+mhs_15m = _first_number(srow, ["mhs 15m", "mhs_15m"])
+mhs_24h = _first_number(srow, ["mhs 24h", "mhs_24h"])
+mhs_av  = _first_number(srow, ["mhs av", "mhs_av", "mhs avg", "mhs_avg"])
 
-        # TH/s convenience
-        hr_th = (hr_gh / 1000.0) if isinstance(hr_gh, (int, float)) and hr_gh is not None else None
-        hr_avg_th = (hr_avg / 1000.0) if isinstance(hr_avg, (int, float)) and hr_avg is not None else None
+hr_5s_gh  = (float(mhs_5s) / 1000.0) if mhs_5s is not None else None
+hr_1m_gh  = (float(mhs_1m) / 1000.0) if mhs_1m is not None else None
+hr_5m_gh  = (float(mhs_5m) / 1000.0) if mhs_5m is not None else None
+hr_15m_gh = (float(mhs_15m) / 1000.0) if mhs_15m is not None else None
+hr_24h_gh = (float(mhs_24h) / 1000.0) if mhs_24h is not None else None
+hr_av_gh  = (float(mhs_av) / 1000.0) if mhs_av is not None else None
+
+# Convenience TH/s (UI can display if desired)
+hr_5s_th  = (hr_5s_gh / 1000.0) if hr_5s_gh is not None else None
+hr_av_th  = (hr_av_gh / 1000.0) if hr_av_gh is not None else None
 
         power = _first_number(srow, ["power", "watts", "watt", "power_w", "power (w)"])
         if power is None:
