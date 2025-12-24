@@ -19,15 +19,15 @@ import socket
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import logging
-
 import requests
 
 import db
+import logging
+
+logger = logging.getLogger('hashstacker.dashboard')
+
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
-
-logger = logging.getLogger(\"hashstacker.dashboard\")
 
 # Resolve all on-disk paths relative to this file (not the process CWD). This
 # avoids accidental "multiple DB/files" situations in Docker/Portainer.
@@ -1046,16 +1046,14 @@ def _extract_temperature(value: Any) -> Optional[float]:
     return None
 
 
+
 def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, req_id: int = 1) -> Dict[str, Any]:
     """BOSminer/Braiins PAPI: JSON command over TCP (usually port 4028).
 
-    Notes:
-      * BOSminer responds with a single JSON object, but some TCP reads may return
-        extra bytes (multiple JSON objects, prompts, or trailing whitespace).
-      * We therefore parse the first valid JSON object and ignore any trailing data.
+    Some BOSminer builds may append extra bytes or multiple JSON objects. We decode the
+    first JSON object and ignore any trailing data to avoid json.loads("Extra data").
     """
-    payload = json.dumps({"command": command, "id": req_id}) + "
-"
+    payload = json.dumps({"command": command, "id": req_id}) + "\n"
     buf = b""
     with socket.create_connection((ip, int(port)), timeout=timeout_s) as sock:
         sock.settimeout(timeout_s)
@@ -1075,33 +1073,32 @@ def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, r
     if not txt:
         raise RuntimeError("Empty response")
 
-    # Try robust parsing: accept first JSON object, ignore trailing bytes.
-    dec = json.JSONDecoder()
-    # Some firmwares send multiple JSON objects separated by newlines; pick the last non-empty line first.
-    candidates = [t for t in txt.splitlines() if t.strip()]
-    to_try = []
-    if candidates:
-        # try last line first (common when banner/prompt precedes JSON)
-        to_try.append(candidates[-1].strip())
-        if len(candidates) > 1:
-            # also try the entire buffer as fallback
-            to_try.append(txt)
-    else:
-        to_try.append(txt)
+    # If there are multiple lines, prefer the line containing the first '{'
+    # but keep full text for raw_decode.
+    decoder = json.JSONDecoder()
 
-    last_err = None
-    for blob in to_try:
-        try:
-            obj, _idx = dec.raw_decode(blob.lstrip())
-            if not isinstance(obj, dict):
-                raise RuntimeError("Unexpected response type")
-            return obj
-        except Exception as e:
-            last_err = e
-            continue
+    # Find first JSON object in the string
+    s = txt
+    first_brace = s.find("{")
+    if first_brace > 0:
+        s = s[first_brace:]
 
-    raise RuntimeError(f"Invalid JSON response: {last_err}")
+    try:
+        obj, _idx = decoder.raw_decode(s)
+    except Exception:
+        # Fallback: try last non-empty line (common when logs/prefixes are present)
+        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+        if not lines:
+            raise
+        line = lines[-1]
+        first_brace = line.find("{")
+        if first_brace > 0:
+            line = line[first_brace:]
+        obj, _idx = decoder.raw_decode(line)
 
+    if not isinstance(obj, dict):
+        raise RuntimeError("Unexpected response type")
+    return obj
 
 def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     """
@@ -1144,175 +1141,151 @@ def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]
     return False, None, last_err or "no response"
 
 
+
 def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Poll Braiins OS / BOSminer PAPI (cgminer-compatible JSON over TCP, usually :4028).
+
+    Key differences vs classic cgminer:
+    - BOSminer commonly reports hashrate fields in **MHS** (e.g., "MHS 5s", "MHS av").
+      We normalize to **GHS** for dashboard parity, and also expose **TH/s** convenience fields.
+    - Not all BOSminer builds implement extra commands like temps/fans; those are optional.
+    """
     port = int((cfg or {}).get("papi_port") or 4028)
-
-    def _num(x: Any) -> Optional[float]:
-        try:
-            if x is None:
-                return None
-            if isinstance(x, (int, float)):
-                return float(x)
-            s = str(x).strip()
-            if s == "":
-                return None
-            return float(s)
-        except Exception:
-            return None
-
-    def _mhs_to_ghs(mhs: Optional[float]) -> Optional[float]:
-        if mhs is None:
-            return None
-        return mhs / 1000.0  # 1000 MH/s = 1 GH/s
-
-    def _ghs_to_ths(ghs: Optional[float]) -> Optional[float]:
-        if ghs is None:
-            return None
-        return ghs / 1000.0  # 1000 GH/s = 1 TH/s
-
     try:
         summary = _bosminer_query(ip, "summary", timeout_s, port=port, req_id=1)
 
-        # Optional sections (not all BOSminer versions implement all commands)
-        temps = None
-        fans = None
-        stats = None
+        # Optional extras (best-effort)
+        pools = None
+        devs = None
         try:
-            temps = _bosminer_query(ip, "temps", timeout_s, port=port, req_id=2)
-        except Exception:
-            temps = None
+            pools = _bosminer_query(ip, "pools", timeout_s, port=port, req_id=2)
+        except Exception as e:
+            logger.warning("BOSminer pools query failed ip=%s:%s err=%s", ip, port, e)
         try:
-            fans = _bosminer_query(ip, "fans", timeout_s, port=port, req_id=3)
-        except Exception:
-            fans = None
-        try:
-            stats = _bosminer_query(ip, "stats", timeout_s, port=port, req_id=4)
-        except Exception:
-            stats = None
+            devs = _bosminer_query(ip, "devs", timeout_s, port=port, req_id=3)
+        except Exception as e:
+            # devs isn't required for hashrate; keep it soft-fail
+            logger.warning("BOSminer devs query failed ip=%s:%s err=%s", ip, port, e)
 
-        s_rows = (summary.get("SUMMARY") or [])
-        if not s_rows:
-            return False, None, "No SUMMARY section"
-        s0 = s_rows[0]
+        # summary parsing
+        srow: Any = None
+        if isinstance(summary, dict):
+            if isinstance(summary.get("SUMMARY"), list) and summary["SUMMARY"]:
+                srow = summary["SUMMARY"][0]
+            elif isinstance(summary.get("SUMMARY"), dict):
+                srow = summary["SUMMARY"]
+            else:
+                srow = summary
 
-        # Hashrate windows from BOSminer summary (typically in MH/s)
-        hr_5s_gh = _mhs_to_ghs(_num(s0.get("MHS 5s")))
-        hr_1m_gh = _mhs_to_ghs(_num(s0.get("MHS 1m")))
-        hr_5m_gh = _mhs_to_ghs(_num(s0.get("MHS 5m")))
-        hr_15m_gh = _mhs_to_ghs(_num(s0.get("MHS 15m")))
-        hr_24h_gh = _mhs_to_ghs(_num(s0.get("MHS 24h")))
-        hr_avg_gh = _mhs_to_ghs(_num(s0.get("MHS av")))
+        if not isinstance(srow, dict):
+            return False, None, "No BOSminer SUMMARY row"
 
-        # Prefer "average" as the primary dashboard hashrate (stable)
-        hr_primary_gh = hr_avg_gh or hr_15m_gh or hr_5m_gh or hr_1m_gh or hr_5s_gh
+        # Hashrate normalization: BOSminer -> MHS, classic -> GHS
+        mh_5s = _first_number(srow, ["mhs 5s", "mhs_5s", "mhs5s"])
+        mh_1m = _first_number(srow, ["mhs 1m", "mhs_1m", "mhs1m"])
+        mh_5m = _first_number(srow, ["mhs 5m", "mhs_5m", "mhs5m"])
+        mh_15m = _first_number(srow, ["mhs 15m", "mhs_15m", "mhs15m"])
+        mh_24h = _first_number(srow, ["mhs 24h", "mhs_24h", "mhs24h"])
+        mh_av = _first_number(srow, ["mhs av", "mhs_av", "mhsav", "mhs average"])
 
-        accepted = int(_num(s0.get("Accepted")) or 0)
-        rejected = int(_num(s0.get("Rejected")) or 0)
-        best_share = _num(s0.get("Best Share"))
-        hw_errors = int(_num(s0.get("Hardware Errors")) or 0)
+        gh_5s = _first_number(srow, ["ghs 5s", "ghs_5s", "ghs5s"])
+        gh_av = _first_number(srow, ["ghs av", "ghs_av", "ghsav", "ghs average"])
 
-        # Temperatures / fans: attempt to extract a few representative values.
-        temps_c: List[float] = []
-        fans_rpm: List[float] = []
+        def mh_to_gh(mh: Optional[float]) -> Optional[float]:
+            return float(mh) / 1000.0 if mh is not None else None
 
-        def _collect_numbers(obj: Any, key_pred) -> List[float]:
-            out: List[float] = []
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if key_pred(str(k)):
-                        n = _num(v)
-                        if n is not None:
-                            out.append(n)
-                    out.extend(_collect_numbers(v, key_pred))
-            elif isinstance(obj, list):
-                for it in obj:
-                    out.extend(_collect_numbers(it, key_pred))
-            return out
+        def gh_to_th(gh: Optional[float]) -> Optional[float]:
+            return float(gh) / 1000.0 if gh is not None else None
 
-        if temps is not None:
-            temps_c.extend(_collect_numbers(temps, lambda k: "temp" in k.lower()))
-        if stats is not None:
-            temps_c.extend(_collect_numbers(stats, lambda k: "temp" in k.lower()))
-        if fans is not None:
-            fans_rpm.extend(_collect_numbers(fans, lambda k: "rpm" in k.lower() or "fan" in k.lower()))
-        if stats is not None:
-            fans_rpm.extend(_collect_numbers(stats, lambda k: "rpm" in k.lower() or ("fan" in k.lower() and "speed" in k.lower())))
+        hr_5s_gh = gh_5s if gh_5s is not None else mh_to_gh(mh_5s)
+        hr_avg_gh = gh_av if gh_av is not None else mh_to_gh(mh_av)
+        hr_1m_gh = mh_to_gh(mh_1m) if mh_1m is not None else None
+        hr_5m_gh = mh_to_gh(mh_5m) if mh_5m is not None else None
+        hr_15m_gh = mh_to_gh(mh_15m) if mh_15m is not None else None
+        hr_24h_gh = mh_to_gh(mh_24h) if mh_24h is not None else None
 
-        # De-dup and sanitize
-        temps_c = [t for t in temps_c if -40.0 < t < 140.0]
-        fans_rpm = [r for r in fans_rpm if 0.0 <= r < 20000.0]
+        # Convenience TH/s
+        hr_5s_th = gh_to_th(hr_5s_gh)
+        hr_avg_th = gh_to_th(hr_avg_gh)
+        hr_1m_th = gh_to_th(hr_1m_gh)
+        hr_5m_th = gh_to_th(hr_5m_gh)
+        hr_15m_th = gh_to_th(hr_15m_gh)
+        hr_24h_th = gh_to_th(hr_24h_gh)
 
-        temp_max = max(temps_c) if temps_c else None
-        temp_avg = (sum(temps_c) / len(temps_c)) if temps_c else None
-        fan_max = max(fans_rpm) if fans_rpm else None
-        fan_avg = (sum(fans_rpm) / len(fans_rpm)) if fans_rpm else None
+        power = _first_number(srow, ["power", "power(w)", "power_w", "watt", "watts"])
+        elapsed = _first_number(srow, ["elapsed", "uptime", "uptime_s"])
+        accepted = _first_number(srow, ["accepted", "shares accepted", "accepted_shares"])
+        rejected = _first_number(srow, ["rejected", "shares rejected", "rejected_shares"])
+        best = _first_number(srow, ["best share", "best_share", "bestshare", "best difficulty", "best_difficulty", "bestdiff"])
+        utility = _first_number(srow, ["utility"])
+        work_utility = _first_number(srow, ["work utility", "work_utility"])
 
-        # Power / efficiency (best-effort)
-        power_w = None
-        eff_j_th = None
+        # Temps best-effort from DEVS
+        temps_list: List[float] = []
+        if isinstance(devs, dict) and isinstance(devs.get("DEVS"), list):
+            for d in devs["DEVS"]:
+                if not isinstance(d, dict):
+                    continue
+                t = _first_number(d, ["temperature", "temp", "chip temp", "board temp"])
+                if t is not None:
+                    temps_list.append(float(t))
+        temp_max = max(temps_list) if temps_list else None
 
-        # Some firmwares expose power in STATS (W / Power / Power Usage)
-        if stats is not None:
-            for k in ("Power", "Power Usage", "Power_W", "PowerW", "Watts"):
-                if k in stats:
-                    power_w = _num(stats.get(k))
-                    break
-            if power_w is None:
-                # try nested extraction
-                pw = _collect_numbers(stats, lambda kk: "power" in kk.lower() and ("w" in kk.lower() or "watts" in kk.lower()))
-                power_w = pw[0] if pw else None
-
-        # Efficiency J/TH = W / TH/s
-        hr_primary_th = _ghs_to_ths(hr_primary_gh)
-        if power_w is not None and hr_primary_th and hr_primary_th > 0:
-            eff_j_th = float(power_w) / float(hr_primary_th)
-
-        desc = None
-        try:
-            desc = (summary.get("STATUS") or [{}])[0].get("Description")
-        except Exception:
-            desc = None
+        # Pools best-effort
+        pools_list: List[Dict[str, Any]] = []
+        if isinstance(pools, dict) and isinstance(pools.get("POOLS"), list):
+            for p in pools["POOLS"]:
+                if not isinstance(p, dict):
+                    continue
+                pools_list.append({
+                    "url": p.get("URL") or p.get("Stratum URL"),
+                    "user": p.get("User"),
+                    "status": p.get("Status"),
+                    "stratum_active": p.get("Stratum Active"),
+                    "accepted": p.get("Accepted"),
+                    "rejected": p.get("Rejected"),
+                    "last_share_time": p.get("Last Share Time"),
+                    "stratum_difficulty": p.get("Stratum Difficulty"),
+                })
 
         info: Dict[str, Any] = {
-            "ip": ip,
-            "type": "bosminer_papi",
+            "type": "Braiins OS (BOSminer PAPI)",
             "papi_port": port,
-            "deviceModel": desc or "BOSminer",
-            # Hashrate in GH/s (UI expects GH/s)
-            "hashRate": hr_primary_gh,
-            "hashRate_THs": hr_primary_th,
+            "deviceModel": "BOSminer",
+            # Existing keys used by UI:
+            "hashrate": hr_5s_gh,
+            "hashRate": hr_5s_gh,
+            "hashrate_avg": hr_avg_gh,
+            "hashRate_avg": hr_avg_gh,
+            "power": power,
+            "uptime": elapsed,
+            "accepted": accepted,
+            "rejected": rejected,
+            "bestShare": best,
+            "utility": utility,
+            "workUtility": work_utility,
+            # Richer windows (GHS)
             "hashRate_5s": hr_5s_gh,
             "hashRate_1m": hr_1m_gh,
             "hashRate_5m": hr_5m_gh,
             "hashRate_15m": hr_15m_gh,
             "hashRate_24h": hr_24h_gh,
-            "hashRate_avg": hr_avg_gh,
-            # Legacy aliases (some UI paths use lowercase)
-            "hashrate": hr_primary_gh,
-            # Shares / errors
-            "acceptedShares": accepted,
-            "rejectedShares": rejected,
-            "hardwareErrors": hw_errors,
-            "bestShare": best_share,
-            # Temps/fans
-            "tempMaxC": temp_max,
-            "tempAvgC": temp_avg,
-            "fanMaxRPM": fan_max,
-            "fanAvgRPM": fan_avg,
-            # Power/efficiency
-            "powerW": power_w,
-            "efficiency_J_TH": eff_j_th,
-            # Raw sections for debugging (small-ish)
-            "raw": {
-                "summary": s0,
-            },
+            # TH/s convenience
+            "hashRate_THs": hr_5s_th,
+            "hashRate_avg_THs": hr_avg_th,
+            "hashRate_1m_THs": hr_1m_th,
+            "hashRate_5m_THs": hr_5m_th,
+            "hashRate_15m_THs": hr_15m_th,
+            "hashRate_24h_THs": hr_24h_th,
+            # Extras
+            "tempMax": temp_max,
+            "temps": temps_list,
+            "pools": pools_list,
         }
 
-        # Mark online if we have at least a hashrate or accepted shares info
         return True, info, None
-
     except Exception as e:
-        logger.warning("BOSminer poll failed ip=%s port=%s err=%s", ip, port, e)
+        logger.warning("BOSminer poll failed ip=%s:%s err=%s", ip, port, e)
         return False, None, str(e)
 
 def _probe_braiins_rest(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
