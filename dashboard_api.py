@@ -654,7 +654,7 @@ def _probe_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str,
             return False, None, "No cgminer version response"
         return True, ver, None
     except Exception as e:
-        print(f"[bosminer_papi] poll failed for {ip}:{port}: {e}")
+        print(f"[avalon_cgminer] probe failed for {ip}: {e}")
         return False, None, str(e)
 
 
