@@ -53,9 +53,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_columns": 0,  # 0 = auto
     "compact_cards": True,
     "enable_scan": True,
-    "scan_default_cidr": "192.168.1.0/24",
+    "scan_default_cidr": "192.168.0.1/24",
     "braiins": {
-        "prefer_rest": True,
+        "prefer_rest": False,
         "rest_scheme": "http",  # http|https (auto will try both)
         "rest_port": 80,
         "rest_username": "",
