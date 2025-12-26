@@ -1507,7 +1507,28 @@ def api_add_device(payload: DeviceCreate):
 
     poll_type_final = "auto"
 
-    # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
+    
+# Braiins / BOSminer hints:
+# - If BOSminer PAPI responds on 4028, mark as bosminer_papi (no creds required).
+# - Else if Braiins gRPC port is reachable (50051), mark as braiins_grpc (requires credentials to fetch metrics).
+poll_type_final = None
+try:
+    ok_papi, _meta, _err = _probe_bosminer_papi(ip, quick, cfg={"papi_port": 4028})
+    if ok_papi:
+        cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("bosminer_papi", ip))
+        poll_type_final = "bosminer_papi"
+except Exception:
+    pass
+
+if poll_type_final is None:
+    try:
+        with socket.create_connection((ip, 50051), timeout=quick):
+            cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("braiins_grpc", ip))
+            poll_type_final = "braiins_grpc"
+    except Exception:
+        pass
+
+# Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
     # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
     try:
         ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
@@ -1690,58 +1711,75 @@ class ScanPayload(BaseModel):
 @router.post("/scan")
 def api_scan(payload: ScanPayload):
     """
-    Scan a CIDR for devices that respond to /api/system/info.
-    Returns a list of found systems (does NOT auto-add).
+    LAN scan:
+      - Bitaxe-style HTTP API: GET http://<ip>/api/system/info
+      - Braiins BOSminer PAPI (cgminer-like JSON): TCP 4028, command "summary"
+      - Braiins gRPC Public API: TCP 50051 (requires grpcurl for full probe; we do a lightweight TCP check here)
+    We return a list of discovered devices with a recommended poll_type.
     """
-    try:
-        net = ipaddress.ip_network(payload.cidr, strict=False)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {payload.cidr}") from e
+    subnet = (payload.subnet or "").strip()
+    if not subnet:
+        raise HTTPException(status_code=400, detail="Missing subnet")
 
-    hosts = [str(h) for h in net.hosts()]
-    if len(hosts) > payload.limit:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Refusing to scan {len(hosts)} hosts (limit {payload.limit}). Use a smaller CIDR or raise limit.",
-        )
+    # Expand CIDR into IPs (existing helper)
+    ips = _cidr_to_ips(subnet)
+    timeout_s = float(payload.timeout_s or 0.45)
 
-    found: List[Dict[str, Any]] = []
-    timeout = float(payload.timeout_s)
+    def tcp_open(ip: str, port: int) -> bool:
+        try:
+            with socket.create_connection((ip, port), timeout=timeout_s):
+                return True
+        except Exception:
+            return False
 
-    def probe(ip: str) -> Optional[Dict[str, Any]]:
-        ok, info, err, detected = _fetch_system_info(ip, timeout, poll_type='auto')
-        if not ok:
-            return None
-        if not _looks_like_supported_miner(detected, info):
-            return None
-        # attach a few convenient fields
-        if isinstance(info, dict):
-            hostname = info.get("hostname") or info.get("host") or None
-            model = info.get("deviceModel") or info.get("ASICModel") or None
-        else:
-            hostname, model = None, None
-        return {"ip": ip, "hostname": hostname, "model": model, "detected": detected, "info": info}
+    def probe_one(ip: str) -> Optional[Dict[str, Any]]:
+        # 1) Bitaxe HTTP
+        try:
+            r = requests.get(f"http://{ip}/api/system/info", timeout=timeout_s)
+            if r.ok:
+                j = r.json()
+                return {"ip": ip, "type": "Bitaxe", "poll_type": "http", "info": j}
+        except Exception:
+            pass
 
-    with ThreadPoolExecutor(max_workers=int(payload.parallel)) as ex:
-        futures = [ex.submit(probe, ip) for ip in hosts]
-        for f in as_completed(futures):
-            item = f.result()
-            if item:
-                found.append(item)
+        # 2) BOSminer PAPI (4028)
+        try:
+            ok, meta, err = _probe_bosminer_papi(ip, timeout_s, cfg={"papi_port": 4028})
+            if ok:
+                return {"ip": ip, "type": "BOSminer", "poll_type": "bosminer_papi", "info": meta or {}}
+        except Exception:
+            pass
 
-    found.sort(key=lambda x: x.get("ip", ""))
-    return {"cidr": payload.cidr, "found": found, "count": len(found)}
+        # 3) Braiins gRPC (50051): lightweight port check
+        if tcp_open(ip, 50051):
+            return {"ip": ip, "type": "Braiins OS (gRPC)", "poll_type": "braiins_grpc", "info": {"grpc_port": 50051}}
 
+        # 4) Avalon cgminer (4028 pipe protocol)
+        try:
+            ok, meta, err = _probe_avalon_cgminer(ip, timeout_s, cfg=None)
+            if ok:
+                return {"ip": ip, "type": "Avalon", "poll_type": "avalon_cgminer", "info": meta or {}}
+        except Exception:
+            pass
 
-def _safe_filename(original: str, content: bytes) -> str:
-    h = hashlib.sha256(content).hexdigest()[:16]
-    base = os.path.basename(original or "file")
-    base = base.replace(" ", "_")
-    root, ext = os.path.splitext(base)
-    ext = (ext or "").lower()[:12]
-    if ext and not re.match(r"^\.[a-z0-9]+$", ext):
-        ext = ""
-    return f"{root[:32]}_{h}{ext}"
+        return None
+
+    results: List[Dict[str, Any]] = []
+    # keep it fast: thread pool
+    with ThreadPoolExecutor(max_workers=min(128, max(8, len(ips)))) as ex:
+        futs = {ex.submit(probe_one, ip): ip for ip in ips}
+        for fut in as_completed(futs):
+            try:
+                item = fut.result()
+                if item:
+                    results.append(item)
+            except Exception:
+                continue
+
+    # stable output order
+    results.sort(key=lambda x: x.get("ip", ""))
+    return {"results": results}
+
 
 
 @router.get("/assets")
