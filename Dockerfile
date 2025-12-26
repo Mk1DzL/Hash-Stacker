@@ -8,6 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+ # grpcurl (static-ish Go binary)
+RUN GRPCURL_VER="1.9.1" \
+  && curl -fsSL -o /tmp/grpcurl.tgz \
+     "https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz" \
+  && tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl \
+  && rm -f /tmp/grpcurl.tgz \
+  && grpcurl --version
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
