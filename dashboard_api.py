@@ -16,8 +16,8 @@ import mimetypes
 import sqlite3
 import re
 import socket
-import shutil
 import subprocess
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -1179,7 +1179,187 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
         return False, None, str(e)
 
 
-def _probe_braiins_rest(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+
+
+# ---- Braiins OS Public API (gRPC on :50051) ----
+
+_BOS_GRPC_TOKEN_CACHE: Dict[str, Tuple[str, float]] = {}  # ip -> (token, expires_at_monotonic)
+
+def _grpcurl_run_json(args: List[str], timeout_s: float) -> Any:
+    """Run grpcurl and parse JSON response.
+
+    We rely on grpcurl being present in the container image. This is a pragmatic approach
+    that avoids bundling protobufs in this repo.
+    """
+    try:
+        p = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("grpcurl timeout")
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip()
+        raise RuntimeError(err or f"grpcurl failed rc={p.returncode}")
+    out = (p.stdout or "").strip()
+    if not out:
+        return {}
+    try:
+        return json.loads(out)
+    except Exception as e:
+        raise RuntimeError(f"grpcurl non-JSON output: {e}: {out[:200]}")
+
+
+def _braiins_grpc_login(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> str:
+    """Login to Braiins OS gRPC and return a cached token."""
+    now = time.monotonic()
+    cached = _BOS_GRPC_TOKEN_CACHE.get(ip)
+    if cached and cached[1] > now + 5:
+        return cached[0]
+
+    username = str(cfg.get("grpc_username") or cfg.get("username") or cfg.get("rest_username") or "root")
+    password = str(cfg.get("grpc_password") or cfg.get("password") or cfg.get("rest_password") or "")
+    port = int(cfg.get("grpc_port") or 50051)
+    if not password:
+        raise RuntimeError("Missing Braiins gRPC password")
+
+    resp = _grpcurl_run_json(
+        [
+            "grpcurl",
+            "-plaintext",
+            "-d",
+            json.dumps({"username": username, "password": password}),
+            f"{ip}:{port}",
+            "braiins.bos.v1.AuthenticationService/Login",
+        ],
+        timeout_s=timeout_s,
+    )
+    token = resp.get("token")
+    if not token:
+        raise RuntimeError("Login returned no token")
+    timeout_val = float(resp.get("timeoutS") or resp.get("timeout_s") or 3600)
+    _BOS_GRPC_TOKEN_CACHE[ip] = (token, now + max(60.0, timeout_val))
+    return token
+
+
+def _probe_braiins_grpc(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Cheap probe: does the gRPC endpoint respond to reflection/list?"""
+    port = int((cfg or {}).get("grpc_port") or 50051)
+    try:
+        # This call does not require auth on your setup.
+        p = subprocess.run(
+            ["grpcurl", "-plaintext", f"{ip}:{port}", "list", "braiins.bos.v1.AuthenticationService"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        if p.returncode != 0:
+            return False, None, (p.stderr or p.stdout or "").strip() or "grpcurl failed"
+        out = (p.stdout or "").strip()
+        if "AuthenticationService" in out or "Login" in out:
+            return True, {"grpc_port": port}, None
+        return False, None, "unexpected grpc list output"
+    except subprocess.TimeoutExpired:
+        return False, None, "grpc probe timeout"
+    except Exception as e:
+        return False, None, str(e)
+
+
+def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Poll Braiins OS gRPC (primary), returning dashboard info dict."""
+    port = int(cfg.get("grpc_port") or 50051)
+    # Give gRPC a little more time than the UI timeout; it can be chatty.
+    t = max(float(timeout_s or 1.2), 2.5)
+    token = _braiins_grpc_login(ip, min(t, 4.0), cfg)
+
+    # IMPORTANT: Braiins expects the token in 'authorization: <token>' (no Bearer).
+    headers = ["-H", f"authorization: {token}"]
+
+    stats = _grpcurl_run_json(
+        ["grpcurl", "-plaintext", *headers, "-d", "{}", f"{ip}:{port}", "braiins.bos.v1.MinerService/GetMinerStats"],
+        timeout_s=min(t, 4.0),
+    )
+
+    # Map hashrate: gRPC reports GH/s already.
+    def _gh(obj: Any, *path: str) -> Optional[float]:
+        cur = obj
+        for k in path:
+            if not isinstance(cur, dict) or k not in cur:
+                return None
+            cur = cur[k]
+        if isinstance(cur, (int, float)):
+            return float(cur)
+        return None
+
+    rh = (((stats.get("minerStats") or {}).get("realHashrate")) or {})
+    gh_5s = _gh(rh, "last5s", "gigahashPerSecond")
+    gh_1m = _gh(rh, "last1m", "gigahashPerSecond")
+    gh_5m = _gh(rh, "last5m", "gigahashPerSecond")
+    gh_15m = _gh(rh, "last15m", "gigahashPerSecond")
+    gh_24h = _gh(rh, "last24h", "gigahashPerSecond")
+    gh_avg = _gh(rh, "sinceRestart", "gigahashPerSecond") or _gh(rh, "last30m", "gigahashPerSecond") or _gh(rh, "last1h", "gigahashPerSecond")
+
+    def gh_to_th(gh: Optional[float]) -> Optional[float]:
+        return float(gh) / 1000.0 if gh is not None else None
+
+    watts = None
+    try:
+        watts_raw = ((stats.get("powerStats") or {}).get("approximatedConsumption") or {}).get("watt")
+        if watts_raw is not None:
+            watts = float(watts_raw)
+    except Exception:
+        watts = None
+
+    j_per_th = None
+    try:
+        j_per_th = float(((stats.get("powerStats") or {}).get("efficiency") or {}).get("joulePerTerahash"))
+    except Exception:
+        j_per_th = None
+
+    pool = stats.get("poolStats") or {}
+    accepted = _first_number(pool, ["acceptedShares", "accepted_shares", "accepted"])
+    rejected = _first_number(pool, ["rejectedShares", "rejected_shares", "rejected"])
+    last_diff = _first_number(pool, ["lastDifficulty", "last_difficulty", "difficulty"])
+    best_share = _first_number(pool, ["bestShare", "best_share"])
+
+    info: Dict[str, Any] = {
+        "device_type": "braiins_grpc",
+        "grpc_port": port,
+        "hashRate_5s": gh_5s,
+        "hashRate_1m": gh_1m,
+        "hashRate_5m": gh_5m,
+        "hashRate_10m": gh_15m,   # closest we have
+        "hashRate_24h": gh_24h,
+        "hashRate_avg": gh_avg,
+        "hashRate_5s_th": gh_to_th(gh_5s),
+        "hashRate_1m_th": gh_to_th(gh_1m),
+        "hashRate_5m_th": gh_to_th(gh_5m),
+        "hashRate_10m_th": gh_to_th(gh_15m),
+        "hashRate_24h_th": gh_to_th(gh_24h),
+        "hashRate_avg_th": gh_to_th(gh_avg),
+        "power": watts,
+        "efficiency_j_th": j_per_th,
+        "accepted": accepted,
+        "rejected": rejected,
+        "last_difficulty": last_diff,
+        "best_share": best_share,
+        "raw_stats": stats,  # keep for future UI enhancements
+        "benchmark_supported": False,
+    }
+
+    # gRPC sometimes returns partial objects; require at least hashrate to be considered ok.
+    if gh_5s is None and gh_avg is None:
+        return False, None, "No hashrate fields from gRPC"
+
+    return True, info, None
+
+def _probe_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     """Detect Braiins OS REST API via /api/v1/miner/details over http/https.
 
     Older versions of this project probed /api/v1/version and treated any 401/403
@@ -1281,171 +1461,7 @@ def _braiins_get_json(ip: str, base_url: str, path: str, cfg: Dict[str, Any], ti
     return js if isinstance(js, dict) else {"raw": js}, r.status_code
 
 
-
-# ---- Braiins OS gRPC Public API (via grpcurl) ----
-# We use grpcurl (already available in your container) so we don't need grpcio/protos.
-# Token auth on Braiins OS commonly expects the raw token in the 'authorization' header
-# (NOT 'Bearer <token>'). We try both quietly.
-_BOS_GRPC_TOKEN_CACHE: Dict[str, Tuple[str, float]] = {}  # ip -> (token, expiry_epoch)
-
-def _grpcurl_bin() -> Optional[str]:
-    for p in ("grpcurl", "/usr/local/bin/grpcurl", "/usr/bin/grpcurl"):
-        if shutil.which(p) or os.path.exists(p):
-            return p if p == "grpcurl" else p
-    return None
-
-def _grpc_call_json(ip: str, timeout_s: float, args: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    binp = _grpcurl_bin()
-    if not binp:
-        return None, "grpcurl not found"
-    cmd = [binp, "-plaintext", "-max-time", str(max(1.5, float(timeout_s or 1.2))), f"{ip}:50051"] + args
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=max(3.0, float(timeout_s or 1.2) + 2.0))
-        if p.returncode != 0:
-            # keep stderr short
-            err = (p.stderr or p.stdout or "").strip().splitlines()[-1] if (p.stderr or p.stdout) else "grpcurl failed"
-            return None, err
-        out = (p.stdout or "").strip()
-        if not out:
-            return None, "empty grpc response"
-        return json.loads(out), None
-    except Exception as e:
-        return None, str(e)
-
-def _bos_grpc_login(ip: str, timeout_s: float, username: str, password: str) -> Tuple[Optional[str], Optional[str]]:
-    # cache key by ip+username (password changes should just create a new token)
-    cache_key = f"{ip}|{username}"
-    now = time.time()
-    tok, exp = _BOS_GRPC_TOKEN_CACHE.get(cache_key, (None, 0.0))
-    if tok and exp - now > 30:
-        return tok, None
-
-    req = {"username": username, "password": password}
-    js, err = _grpc_call_json(ip, timeout_s, ["-d", json.dumps(req), "braiins.bos.v1.AuthenticationService/Login"])
-    if not js or err:
-        return None, err or "login failed"
-    token = js.get("token")
-    timeout = js.get("timeoutS") or js.get("timeout_s") or 3600
-    try:
-        timeout = float(timeout)
-    except Exception:
-        timeout = 3600
-    if not token:
-        return None, "no token in login response"
-    _BOS_GRPC_TOKEN_CACHE[cache_key] = (str(token), now + timeout)
-    return str(token), None
-
-def _bos_grpc_authed_call(ip: str, timeout_s: float, token: str, method: str, body: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    body = body or {}
-    # Try raw token first (known-working), then Bearer fallback.
-    for hdr in (f"authorization: {token}", f"authorization: Bearer {token}"):
-        js, err = _grpc_call_json(ip, timeout_s, ["-H", hdr, "-d", json.dumps(body), method])
-        if js and not err:
-            return js, None
-        # If it's not an auth error, don't keep trying.
-        if err and "Unauthenticated" not in err and "invalid authentication" not in err and "Missing or invalid" not in err:
-            return None, err
-    return None, "Unauthenticated"
-
-def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    username = (cfg or {}).get("rest_username") or (cfg or {}).get("username") or "root"
-    password = (cfg or {}).get("rest_password") or (cfg or {}).get("password")
-    if not password:
-        return False, None, "missing password"
-    token, err = _bos_grpc_login(ip, timeout_s, str(username), str(password))
-    if not token:
-        return False, None, err or "login failed"
-
-    # Primary: GetMinerStats (rich metrics)
-    js, err = _bos_grpc_authed_call(ip, timeout_s, token, "braiins.bos.v1.MinerService/GetMinerStats", {})
-    if not js or err:
-        return False, None, err or "GetMinerStats failed"
-
-    info: Dict[str, Any] = {
-        "type": "Braiins OS (gRPC)",
-        "papi_port": int((cfg or {}).get("papi_port") or 4028),
-        "grpc_port": 50051,
-        "grpc_auth": True,
-        "raw": {"grpc": js},
-    }
-
-    # Map hashrate (GH/s in response; UI expects GH/s and/or TH/s convenience)
-    ms = (js.get("minerStats") or {})
-    rh = (ms.get("realHashrate") or {})
-    def gh(path: List[str]) -> Optional[float]:
-        cur: Any = rh
-        for k in path:
-            if not isinstance(cur, dict): 
-                return None
-            cur = cur.get(k)
-        if isinstance(cur, dict):
-            v = cur.get("gigahashPerSecond")
-            try:
-                return float(v)
-            except Exception:
-                return None
-        return None
-
-    hr_5s = gh(["last5s"])
-    hr_1m = gh(["last1m"])
-    hr_5m = gh(["last5m"])
-    hr_15m = gh(["last15m"])
-    hr_24h = gh(["last24h"])
-    hr_avg = gh(["sinceRestart"])  # closest "avg" metric
-
-    # Provide multiple key spellings for frontend compatibility
-    if hr_5s is not None:
-        info["hashRate"] = hr_5s
-        info["hashrate"] = hr_5s
-        info["hashRate_5s"] = hr_5s
-        info["hashRate_THs"] = hr_5s / 1000.0
-    if hr_avg is not None:
-        info["hashRate_avg"] = hr_avg
-        info["hashRate_avg_THs"] = hr_avg / 1000.0
-    if hr_1m is not None:
-        info["hashRate_1m"] = hr_1m
-        info["hashRate_1m_THs"] = hr_1m / 1000.0
-    if hr_5m is not None:
-        info["hashRate_5m"] = hr_5m
-        info["hashRate_5m_THs"] = hr_5m / 1000.0
-    if hr_15m is not None:
-        info["hashRate_15m"] = hr_15m
-        info["hashRate_15m_THs"] = hr_15m / 1000.0
-    if hr_24h is not None:
-        info["hashRate_24h"] = hr_24h
-        info["hashRate_24h_THs"] = hr_24h / 1000.0
-
-    # Pool stats / best share
-    ps = (js.get("poolStats") or {})
-    def to_int(x):
-        try:
-            return int(str(x))
-        except Exception:
-            return None
-    info["accepted"] = to_int(ps.get("acceptedShares"))
-    info["rejected"] = to_int(ps.get("rejectedShares"))
-    info["bestshare"] = to_int(ps.get("bestShare"))
-    info["lastdifficulty"] = to_int(ps.get("lastDifficulty"))
-
-    # Power + efficiency
-    pws = (js.get("powerStats") or {})
-    cons = (pws.get("approximatedConsumption") or {})
-    eff = (pws.get("efficiency") or {})
-    try:
-        info["power"] = float(cons.get("watt"))
-    except Exception:
-        pass
-    try:
-        info["efficiency_j_th"] = float(eff.get("joulePerTerahash"))
-    except Exception:
-        pass
-
-    # Mark last_seen for DB updates
-    info["last_seen"] = int(time.time())
-    return True, info, None
-
-
-def _poll_braiins_rest(
+def _poll_braiins_grpc(
     ip: str,
     timeout_s: float,
     cfg: Dict[str, Any],
@@ -1454,7 +1470,7 @@ def _poll_braiins_rest(
     """Poll Braiins OS Public REST API for stats/temps/fans."""
     try:
         if not rest_meta:
-            ok, rest_meta, err = _probe_braiins_rest(ip, max(0.2, min(0.8, timeout_s)), cfg)
+            ok, rest_meta, err = _probe_braiins_grpc(ip, max(0.2, min(0.8, timeout_s)), cfg)
             if not ok:
                 return False, None, err
         base = rest_meta.get("base_url") if rest_meta else None
@@ -1478,15 +1494,6 @@ def _poll_braiins_rest(
                 "authRequired": True,
                 "rest_base": base,
             }
-            # If REST requires auth or can't return stats, try BOSminer PAPI as a fallback so the dashboard still shows metrics.
-            try:
-                ok_p, info_p, err_p = _poll_bosminer_papi(ip, timeout_s, cfg)
-                if ok_p and info_p:
-                    info_p.setdefault("type", "Braiins OS (BOSminer PAPI fallback)")
-                    info_p["rest_auth_required"] = True
-                    return True, info_p, None
-            except Exception as e:
-                logger.info("BOSminer fallback after REST authRequired failed ip=%s err=%s", ip, e)
             return True, info, None
 
         
@@ -1629,18 +1636,7 @@ def _poll_braiins_rest(
         if rej is not None:
             info["sharesRejected"] = rej
         if best is not None:
-            info["bestDiff"] = best        # If REST returned but we still have no hashrate metrics, fall back to BOSminer PAPI (port 4028).
-        if not info.get("hashRate") and not info.get("hashrate"):
-            try:
-                ok_p, info_p, err_p = _poll_bosminer_papi(ip, timeout_s, cfg)
-                if ok_p and info_p and (info_p.get("hashRate") or info_p.get("hashrate")):
-                    info_p["rest_fallback_used"] = True
-                    return True, info_p, None
-                if err_p:
-                    logger.info("BOSminer fallback (no REST metrics) ip=%s err=%s", ip, err_p)
-            except Exception as e:
-                logger.info("BOSminer fallback (no REST metrics) exception ip=%s err=%s", ip, e)
-
+            info["bestDiff"] = best
 
         return True, info, None
     except Exception as e:
@@ -1677,7 +1673,7 @@ def _looks_like_http_miner_payload(data: object) -> bool:
 def _looks_like_supported_miner(detected: str, info: object) -> bool:
     """Return True if a (detected, info) pair appears to be a miner we support."""
     d = (detected or "").strip().lower()
-    if d in ("avalon_cgminer", "bosminer_papi", "braiins_rest"):
+    if d in ("avalon_cgminer", "bosminer_papi", "braiins_grpc"):
         return True
     if d in ("http", "bitaxe", "nerdqaxe"):
         return _looks_like_http_miner_payload(info)
@@ -1692,11 +1688,15 @@ def _fetch_system_info(
 ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str], str]:
     pt = (poll_type or "auto").strip().lower()
 
-    # Explicit Braiins OS REST polling
-    if pt in ("braiins", "braiins_rest", "bos_rest", "bos_api", "rest"):
+    # Explicit Braiins OS gRPC polling (preferred on LAN)
+    if pt in ("braiins", "braiins_grpc", "bos_grpc", "grpc"):
         cfg = _merge_braiins_cfg(device_cfg)
-        ok, info, err = _poll_braiins_rest(ip, timeout_s, cfg, None)
-        return ok, info, err, "braiins_rest"
+        ok, info, err = _poll_braiins_grpc(ip, timeout_s, cfg)
+        if ok:
+            return ok, info, err, "braiins_grpc"
+        # fallback to BOSminer PAPI if gRPC fails
+        ok2, info2, err2 = _poll_bosminer_papi(ip, timeout_s, cfg)
+        return ok2, info2, err2 or err, "bosminer_papi"
 
     # Explicit BOSminer/Braiins legacy PAPI polling
     if pt in ("bosminer", "bosminer_papi", "braiins_papi", "papi"):
@@ -1738,12 +1738,15 @@ def _fetch_system_info(
     if ok_probe:
         ok_full, info_a, err_full = _poll_avalon_q(ip, timeout_s)
         return ok_full, info_a, err_full, "avalon_cgminer"
-
-    # Braiins OS REST (HTTP/HTTPS)
-    ok_rest, rest_meta, err_rest = _probe_braiins_rest(ip, quick, cfg)
-    if ok_rest:
-        ok_full, info_r, err_full = _poll_braiins_rest(ip, timeout_s, cfg, rest_meta)
-        return ok_full, info_r, err_full, "braiins_rest"
+    # Braiins OS gRPC (preferred)
+    ok_grpc, grpc_meta, err_grpc = _probe_braiins_grpc(ip, quick, cfg)
+    if ok_grpc:
+        ok_full, info_g, err_full = _poll_braiins_grpc(ip, timeout_s, cfg)
+        if ok_full:
+            return ok_full, info_g, err_full, "braiins_grpc"
+        # If gRPC is present but yields no metrics (or auth missing), fall back to BOSminer.
+        ok_b, info_b, err_b = _poll_bosminer_papi(ip, timeout_s, cfg)
+        return ok_b, info_b, err_b or err_full, "bosminer_papi"
 
     # Finally try BitAxe-style HTTP
     url = f"http://{ip}/api/system/info"
@@ -2004,7 +2007,7 @@ def api_poll_status(
         pt = (d.get("poll_type") or "auto")
         cfg = _parse_device_cfg(d)
         ok, info, err, detected = _fetch_system_info(d["ip"], timeout, poll_type=pt, device_cfg=cfg)
-        poll_update = detected if ok and detected in ("http", "avalon_cgminer", "braiins_rest", "bosminer_papi") else None
+        poll_update = detected if ok and detected in ("http", "avalon_cgminer", "braiins_grpc", "bosminer_papi") else None
         _write_device_poll(d["id"], ok, info, None if ok else err, poll_type=poll_update)
         latest = _get_latest_benchmark_for_ip(d["ip"])
         return {
