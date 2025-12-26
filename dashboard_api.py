@@ -16,6 +16,7 @@ import mimetypes
 import sqlite3
 import re
 import socket
+import subprocess
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -53,9 +54,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_columns": 0,  # 0 = auto
     "compact_cards": True,
     "enable_scan": True,
-    "scan_default_cidr": "192.168.1.0/24",
+    "scan_default_cidr": "192.168.0.1/24",
     "braiins": {
-        "rest_scheme": "http",  # http|https (auto will try both)
+        # Braiins OS devices (LAN):
+        # - Primary: gRPC Public API (requires creds; uses grpcurl binary if present)
+        # - Fallback: BOSminer PAPI (JSON/TCP 4028)
+        "grpc_port": 50051,
+        "grpc_username": "root",
+        "grpc_password": "",
         "papi_port": 4028,
     },
     "animations": {
@@ -650,9 +656,7 @@ def _probe_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str,
             return False, None, "No cgminer version response"
         return True, ver, None
     except Exception as e:
-                      
-                       
-                     
+        print(f"[avalon_cgminer] probe failed for {ip}: {e}")
         return False, None, str(e)
 
 
@@ -935,26 +939,30 @@ _BRAIINS_TOKEN_CACHE: Dict[str, Dict[str, Any]] = {}  # ip -> {"token": str, "ex
 
 
 def _merge_braiins_cfg(device_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Merge global settings defaults with per-device overrides."""
-    cfg = {}
+    """Merge global settings defaults with per-device overrides (Braiins OS gRPC + BOSminer PAPI)."""
+    cfg: Dict[str, Any] = {}
     try:
         s = _get_settings()
         if isinstance(s.get("braiins"), dict):
             cfg.update(s["braiins"])
     except Exception:
         pass
+
     if device_cfg and isinstance(device_cfg, dict):
         # allow either nested {"braiins": {...}} or top-level keys for convenience
         b = device_cfg.get("braiins")
         if isinstance(b, dict):
             cfg.update(b)
-        for k in ("prefer_rest", "rest_scheme", "rest_port", "rest_username", "rest_password", "papi_port"):
+        for k in ("grpc_port", "grpc_username", "grpc_password", "papi_port"):
             if k in device_cfg:
                 cfg[k] = device_cfg[k]
+
     # normalize
+    cfg["grpc_port"] = int(cfg.get("grpc_port") or 50051)
+    cfg["grpc_username"] = str(cfg.get("grpc_username") or "root")
+    cfg["grpc_password"] = str(cfg.get("grpc_password") or "")
     cfg["papi_port"] = int(cfg.get("papi_port") or 4028)
     return cfg
-
 
 def _first_number(d: Any, keys: List[str]) -> Optional[float]:
     """Return first numeric value among candidate keys (case-insensitive), supporting nested dicts."""
@@ -1071,21 +1079,44 @@ def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, r
 
 
 def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Probe BOSminer / Braiins PAPI (cgminer-compatible JSON over TCP, usually :4028).
+
+    Older versions of this project used the "fans" command for probing, but BOSminer builds
+    (and some ASIC firmwares) may not implement that command. Prefer "summary" first, and
+    fall back to other commands.
+    """
     port = int((cfg or {}).get("papi_port") or 4028)
-    try:
-        data = _bosminer_query(ip, "fans", timeout_s, port=port, req_id=1)
-        desc = None
+    last_err: Optional[str] = None
+    for cmd, section in (("summary", "SUMMARY"), ("stats", "STATS"), ("fans", "FANS"), ("pools", "POOLS")):
         try:
-            st = (data.get("STATUS") or [{}])[0]
-            desc = st.get("Description") or st.get("Msg")
-        except Exception:
-            pass
-        # Heuristic: BOSminer responses typically contain STATUS + the section matching the command.
-        if "FANS" in data and "STATUS" in data:
-            return True, {"description": desc, "port": port}, None
-        return False, None, "unexpected response"
-    except Exception as e:
-        return False, None, str(e)
+            data = _bosminer_query(ip, cmd, timeout_s, port=port, req_id=1)
+            if not isinstance(data, dict) or "STATUS" not in data:
+                last_err = "unexpected response"
+                continue
+
+            desc = None
+            try:
+                st = (data.get("STATUS") or [{}])[0]
+                desc = st.get("Description") or st.get("Msg")
+            except Exception:
+                pass
+
+            # Heuristic: STATUS plus the section matching the command indicates a cgminer-like responder.
+            if section in data:
+                return True, {"description": desc, "port": port, "probe_cmd": cmd}, None
+
+            # Some firmwares respond with a top-level key that is pluralized differently; accept any response
+            # that contains STATUS and *some* known section.
+            for k in ("SUMMARY", "STATS", "FANS", "POOLS", "DEVS"):
+                if k in data:
+                    return True, {"description": desc, "port": port, "probe_cmd": cmd}, None
+
+            last_err = "unexpected response"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return False, None, last_err or "no response"
 
 
 def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
@@ -1167,7 +1198,23 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
 
         return True, info, None
     except Exception as e:
+        print(f"[bosminer_papi] poll failed for {ip}:{port}: {e}")
         return False, None, str(e)
+
+
+def _probe_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Detect Braiins OS REST API via /api/v1/miner/details over http/https.
+
+    Older versions of this project probed /api/v1/version and treated any 401/403
+    as a positive signal. That can false-positive on non-miner devices.
+
+    /api/v1/miner/details is a Braiins OS specific endpoint (documented in the
+    official OpenAPI spec) and is much less likely to collide.
+    """
+    pref_port = int(cfg.get("rest_port") or 80)
+    ports = list(dict.fromkeys([pref_port, 80, 443]))
+    schemes = ["https", "http"] if cfg.get("rest_scheme") == "https" else ["http", "https"]
+    last_err: Optional[str] = None
 
     def looks_like_bos_details(js: object) -> bool:
         if not isinstance(js, dict):
@@ -1214,6 +1261,33 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
     return False, None, last_err or "no response"
 
 
+def _braiins_get_token(ip: str, base_url: str, cfg: Dict[str, Any], timeout_s: float) -> Optional[str]:
+    user = str(cfg.get("rest_username") or "").strip()
+    pw = str(cfg.get("rest_password") or "").strip()
+    if not user or not pw:
+        return None
+
+    now = time.time()
+    cached = _BRAIINS_TOKEN_CACHE.get(ip)
+    if cached and cached.get("token") and float(cached.get("expires_at") or 0) > now + 10:
+        return str(cached["token"])
+
+    url = base_url + "/api/v1/auth/login"
+    try:
+        r = requests.post(url, json={"username": user, "password": pw}, timeout=timeout_s, verify=False)
+        if r.status_code >= 400:
+            return None
+        js = r.json() if r.content else {}
+        token = js.get("token") or js.get("access_token") or js.get("jwt")
+        ttl = js.get("timeout_s") or js.get("expires_in") or 3600
+        if token:
+            _BRAIINS_TOKEN_CACHE[ip] = {"token": token, "expires_at": now + float(ttl)}
+            return str(token)
+        return None
+    except Exception:
+        return None
+
+
 def _braiins_get_json(ip: str, base_url: str, path: str, cfg: Dict[str, Any], timeout_s: float) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
     headers = {"Accept": "application/json"}
     token = _braiins_get_token(ip, base_url, cfg, timeout_s)
@@ -1228,6 +1302,188 @@ def _braiins_get_json(ip: str, base_url: str, path: str, cfg: Dict[str, Any], ti
     except Exception:
         return None, r.status_code
     return js if isinstance(js, dict) else {"raw": js}, r.status_code
+
+
+def _poll_braiins_grpc(
+    ip: str,
+    timeout_s: float,
+    cfg: Dict[str, Any],
+    rest_meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Poll Braiins OS Public REST API for stats/temps/fans."""
+    try:
+        if not rest_meta:
+            ok, rest_meta, err = _probe_braiins_grpc(ip, max(0.2, min(0.8, timeout_s)), cfg)
+            if not ok:
+                return False, None, err
+        base = rest_meta.get("base_url") if rest_meta else None
+        if not base:
+            return False, None, "missing base_url"
+
+        details, sc0 = _braiins_get_json(ip, base, "/api/v1/miner/details", cfg, timeout_s)
+
+        stats, sc1 = _braiins_get_json(ip, base, "/api/v1/miner/stats", cfg, timeout_s)
+        hashboards, sc2 = _braiins_get_json(ip, base, "/api/v1/miner/hw/hashboards", cfg, timeout_s)
+        cooling, sc3 = _braiins_get_json(ip, base, "/api/v1/cooling/state", cfg, timeout_s)
+        # hostname (nice-to-have)
+        netinfo, _sc4 = _braiins_get_json(ip, base, "/api/v1/network/", cfg, max(0.3, min(0.9, timeout_s)))
+
+        # If we have no creds and got 401s, return a stub that tells the UI what's missing.
+        if (stats is None and sc1 in (401, 403)) or (hashboards is None and sc2 in (401, 403)):
+            info = {
+                "type": "Braiins OS (gRPC)",
+                "deviceModel": "Braiins OS",
+                "hostname": (netinfo or {}).get("hostname"),
+                "authRequired": True,
+                "rest_base": base,
+            }
+            return True, info, None
+
+        
+        # Prefer identity info from /api/v1/miner/details when available
+        if isinstance(details, dict):
+            hn = details.get("hostname")
+            if hn:
+                info["hostname"] = hn
+
+            # Try to pull a real hardware model (Antminer model, etc.) from miner_identity
+            model = None
+            mid = details.get("miner_identity")
+            if isinstance(mid, dict):
+                # Prefer keys that look like model/name
+                for k in ("model", "hardware_model", "hardwareModel", "name", "type", "variant"):
+                    v = mid.get(k)
+                    if isinstance(v, str) and v.strip():
+                        model = v.strip()
+                        break
+                if model is None:
+                    # fall back to first non-empty string value
+                    for v in mid.values():
+                        if isinstance(v, str) and v.strip():
+                            model = v.strip()
+                            break
+
+            # If we didn't get it from miner_identity, try sticker_hashrate/container fields
+            if model is None:
+                v = details.get("platform")
+                if isinstance(v, (str, int)):
+                    model = str(v)
+
+            if model:
+                info["deviceModel"] = model
+
+            info.setdefault("raw", {}).setdefault("details", details)
+
+        # Temperatures: use max highest_chip_temp and board_temp if available
+        chip_vals: List[float] = []
+        board_vals: List[float] = []
+        hb_list = (hashboards or {}).get("hashboards")
+        if isinstance(hb_list, list):
+            for hb in hb_list:
+                if not isinstance(hb, dict):
+                    continue
+                chip_vals.append(_extract_temperature(hb.get("highest_chip_temp")) or None)
+                # prefer board_temp else outlet temp
+                board_vals.append(_extract_temperature(hb.get("board_temp")) or _extract_temperature(hb.get("highest_outlet_temp")) or None)
+            chip_vals = [v for v in chip_vals if isinstance(v, (int, float))]
+            board_vals = [v for v in board_vals if isinstance(v, (int, float))]
+        if chip_vals:
+            info["temp"] = max(chip_vals)
+        if board_vals:
+            info["boardTemp"] = max(board_vals)
+
+        # Fans: average target_speed_ratio (0-1) -> %
+        fanspeed = None
+        fanrpm = None
+        fans_list = (cooling or {}).get("fans")
+        if isinstance(fans_list, list):
+            ratios = []
+            rpms = []
+            for f in fans_list:
+                if not isinstance(f, dict):
+                    continue
+                r = _first_number(f, ["target_speed_ratio", "speed_ratio", "target_speed", "speed"])
+                if r is not None:
+                    ratios.append(r)
+                rpm = _first_number(f, ["rpm", "speed_rpm"])
+                if rpm is not None:
+                    rpms.append(rpm)
+            if ratios:
+                # if ratios look like 0-1, convert; if already 0-100, keep
+                avg = sum(ratios)/len(ratios)
+                fanspeed = avg*100.0 if avg <= 1.5 else avg
+            if rpms:
+                fanrpm = sum(rpms)/len(rpms)
+        if fanspeed is not None:
+            info["fanspeed"] = fanspeed
+        if fanrpm is not None:
+            info["fanrpm"] = fanrpm
+
+        # Hashrate / power / shares / best diff from stats (best-effort heuristics)
+        ms = (stats or {}).get("miner_stats") if isinstance(stats, dict) else None
+        ps = (stats or {}).get("pool_stats") if isinstance(stats, dict) else None
+        pws = (stats or {}).get("power_stats") if isinstance(stats, dict) else None
+
+        # hashrate
+        hr = None
+        for src in (ms, ps, stats):
+            if hr is not None:
+                break
+            if isinstance(src, dict):
+                hr = _first_number(src, ["hashrate_ghs", "hashrate_gh", "ghs", "ghs_5s", "hashrate_ths", "ths", "hashrate"])
+        if hr is not None:
+            # If it looks like TH/s, convert to GH/s
+            if hr < 200 and (_deep_find_numbers(stats, ["ths"], max_hits=1) or _deep_find_numbers(stats, ["hashrate_th"], max_hits=1)):
+                info["hashrate"] = hr * 1000.0
+            else:
+                # heuristic: if "hashrate" is in H/s, it's huge; convert to GH
+                if hr > 1e6:
+                    info["hashrate"] = hr / 1e9
+                else:
+                    info["hashrate"] = hr
+
+        # power
+        pw = None
+        for src in (pws, ms, stats):
+            if pw is not None:
+                break
+            if isinstance(src, dict):
+                pw = _first_number(src, ["power_w", "power", "watts", "watt", "consumption_w"])
+        if pw is not None:
+            info["power"] = pw
+
+        # shares + rejected
+        acc = None
+        rej = None
+        best = None
+        for src in (ps, ms, stats):
+            if isinstance(src, dict):
+                if acc is None:
+                    acc = _first_number(src, ["accepted", "shares_accepted", "accepted_shares", "sharesAccepted"])
+                if rej is None:
+                    rej = _first_number(src, ["rejected", "shares_rejected", "rejected_shares", "sharesRejected"])
+                if best is None:
+                    best = _first_number(src, ["best_difficulty", "best_diff", "bestshare", "best_share", "best"])
+        if acc is None:
+            hits = _deep_find_numbers(stats, ["accepted"], max_hits=1)
+            acc = hits[0] if hits else None
+        if rej is None:
+            hits = _deep_find_numbers(stats, ["rejected"], max_hits=1)
+            rej = hits[0] if hits else None
+        if best is None:
+            hits = _deep_find_numbers(stats, ["best"], max_hits=1)
+            best = hits[0] if hits else None
+
+        if acc is not None:
+            info["sharesAccepted"] = acc
+        if rej is not None:
+            info["sharesRejected"] = rej
+        if best is not None:
+            info["bestDiff"] = best
+
+        return True, info, None
+    except Exception as e:
+        return False, None, str(e)
 
 
 def _looks_like_http_miner_payload(data: object) -> bool:
@@ -1275,10 +1531,15 @@ def _fetch_system_info(
 ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str], str]:
     pt = (poll_type or "auto").strip().lower()
 
-    # Explicit Braiins OS REST polling
-    if pt in ("braiins", "braiins_grpc", "bos_rest", "bos_api", "rest"):
+    # Explicit Braiins OS gRPC polling (primary) + BOSminer fallback
+    if pt in ("braiins", "braiins_grpc", "grpc"):
         cfg = _merge_braiins_cfg(device_cfg)
-        ok, info, err = _poll_braiins_grpc(ip, timeout_s, cfg, None)
+        ok, info, err = _poll_braiins_grpc(ip, timeout_s, cfg)
+        if not ok:
+            ok2, info2, err2 = _poll_bosminer_papi(ip, timeout_s, cfg)
+            if ok2:
+                return ok2, info2, None, "bosminer_papi"
+            return False, None, err or err2, "braiins_grpc"
         return ok, info, err, "braiins_grpc"
 
     # Explicit BOSminer/Braiins legacy PAPI polling
@@ -1507,28 +1768,7 @@ def api_add_device(payload: DeviceCreate):
 
     poll_type_final = "auto"
 
-    
-# Braiins / BOSminer hints:
-# - If BOSminer PAPI responds on 4028, mark as bosminer_papi (no creds required).
-# - Else if Braiins gRPC port is reachable (50051), mark as braiins_grpc (requires credentials to fetch metrics).
-poll_type_final = None
-try:
-    ok_papi, _meta, _err = _probe_bosminer_papi(ip, quick, cfg={"papi_port": 4028})
-    if ok_papi:
-        cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("bosminer_papi", ip))
-        poll_type_final = "bosminer_papi"
-except Exception:
-    pass
-
-if poll_type_final is None:
-    try:
-        with socket.create_connection((ip, 50051), timeout=quick):
-            cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("braiins_grpc", ip))
-            poll_type_final = "braiins_grpc"
-    except Exception:
-        pass
-
-# Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
+    # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
     # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
     try:
         ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
@@ -1711,75 +1951,58 @@ class ScanPayload(BaseModel):
 @router.post("/scan")
 def api_scan(payload: ScanPayload):
     """
-    LAN scan:
-      - Bitaxe-style HTTP API: GET http://<ip>/api/system/info
-      - Braiins BOSminer PAPI (cgminer-like JSON): TCP 4028, command "summary"
-      - Braiins gRPC Public API: TCP 50051 (requires grpcurl for full probe; we do a lightweight TCP check here)
-    We return a list of discovered devices with a recommended poll_type.
+    Scan a CIDR for devices that respond to /api/system/info.
+    Returns a list of found systems (does NOT auto-add).
     """
-    subnet = (payload.subnet or "").strip()
-    if not subnet:
-        raise HTTPException(status_code=400, detail="Missing subnet")
+    try:
+        net = ipaddress.ip_network(payload.cidr, strict=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {payload.cidr}") from e
 
-    # Expand CIDR into IPs (existing helper)
-    ips = _cidr_to_ips(subnet)
-    timeout_s = float(payload.timeout_s or 0.45)
+    hosts = [str(h) for h in net.hosts()]
+    if len(hosts) > payload.limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Refusing to scan {len(hosts)} hosts (limit {payload.limit}). Use a smaller CIDR or raise limit.",
+        )
 
-    def tcp_open(ip: str, port: int) -> bool:
-        try:
-            with socket.create_connection((ip, port), timeout=timeout_s):
-                return True
-        except Exception:
-            return False
+    found: List[Dict[str, Any]] = []
+    timeout = float(payload.timeout_s)
 
-    def probe_one(ip: str) -> Optional[Dict[str, Any]]:
-        # 1) Bitaxe HTTP
-        try:
-            r = requests.get(f"http://{ip}/api/system/info", timeout=timeout_s)
-            if r.ok:
-                j = r.json()
-                return {"ip": ip, "type": "Bitaxe", "poll_type": "http", "info": j}
-        except Exception:
-            pass
+    def probe(ip: str) -> Optional[Dict[str, Any]]:
+        ok, info, err, detected = _fetch_system_info(ip, timeout, poll_type='auto')
+        if not ok:
+            return None
+        if not _looks_like_supported_miner(detected, info):
+            return None
+        # attach a few convenient fields
+        if isinstance(info, dict):
+            hostname = info.get("hostname") or info.get("host") or None
+            model = info.get("deviceModel") or info.get("ASICModel") or None
+        else:
+            hostname, model = None, None
+        return {"ip": ip, "hostname": hostname, "model": model, "detected": detected, "info": info}
 
-        # 2) BOSminer PAPI (4028)
-        try:
-            ok, meta, err = _probe_bosminer_papi(ip, timeout_s, cfg={"papi_port": 4028})
-            if ok:
-                return {"ip": ip, "type": "BOSminer", "poll_type": "bosminer_papi", "info": meta or {}}
-        except Exception:
-            pass
+    with ThreadPoolExecutor(max_workers=int(payload.parallel)) as ex:
+        futures = [ex.submit(probe, ip) for ip in hosts]
+        for f in as_completed(futures):
+            item = f.result()
+            if item:
+                found.append(item)
 
-        # 3) Braiins gRPC (50051): lightweight port check
-        if tcp_open(ip, 50051):
-            return {"ip": ip, "type": "Braiins OS (gRPC)", "poll_type": "braiins_grpc", "info": {"grpc_port": 50051}}
+    found.sort(key=lambda x: x.get("ip", ""))
+    return {"cidr": payload.cidr, "found": found, "count": len(found)}
 
-        # 4) Avalon cgminer (4028 pipe protocol)
-        try:
-            ok, meta, err = _probe_avalon_cgminer(ip, timeout_s, cfg=None)
-            if ok:
-                return {"ip": ip, "type": "Avalon", "poll_type": "avalon_cgminer", "info": meta or {}}
-        except Exception:
-            pass
 
-        return None
-
-    results: List[Dict[str, Any]] = []
-    # keep it fast: thread pool
-    with ThreadPoolExecutor(max_workers=min(128, max(8, len(ips)))) as ex:
-        futs = {ex.submit(probe_one, ip): ip for ip in ips}
-        for fut in as_completed(futs):
-            try:
-                item = fut.result()
-                if item:
-                    results.append(item)
-            except Exception:
-                continue
-
-    # stable output order
-    results.sort(key=lambda x: x.get("ip", ""))
-    return {"results": results}
-
+def _safe_filename(original: str, content: bytes) -> str:
+    h = hashlib.sha256(content).hexdigest()[:16]
+    base = os.path.basename(original or "file")
+    base = base.replace(" ", "_")
+    root, ext = os.path.splitext(base)
+    ext = (ext or "").lower()[:12]
+    if ext and not re.match(r"^\.[a-z0-9]+$", ext):
+        ext = ""
+    return f"{root[:32]}_{h}{ext}"
 
 
 @router.get("/assets")
