@@ -654,7 +654,7 @@ def _probe_avalon_q(ip: str, timeout_s: float) -> Tuple[bool, Optional[Dict[str,
             return False, None, "No cgminer version response"
         return True, ver, None
     except Exception as e:
-        logger.debug("[avalon_cgminer] probe failed for %s: %s", ip, e)
+        print(f"[avalon_cgminer] probe failed for {ip}: {e}")
         return False, None, str(e)
 
 
@@ -1120,9 +1120,9 @@ def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]
 def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     port = int((cfg or {}).get("papi_port") or 4028)
     try:
-        summary = _bosminer_query(ip, "summary", timeout_s, port=port, req_id=1)
-        temps = _bosminer_query(ip, "temps", timeout_s, port=port, req_id=2)
-        fans = _bosminer_query(ip, "fans", timeout_s, port=port, req_id=3)
+        summary = _bosminer_query(ip, "summary", t, port=port, req_id=1)
+        temps = _bosminer_query(ip, "temps", t, port=port, req_id=2)
+        fans = _bosminer_query(ip, "fans", t, port=port, req_id=3)
 
         # summary parsing (BOSminer tends to mirror cgminer-ish keys)
         srow = None
@@ -1144,7 +1144,7 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
         if power is None:
             # some firmwares expose power under STATS/DEVS; try a quick fallback
             try:
-                stats = _bosminer_query(ip, "stats", timeout_s, port=port, req_id=4)
+                stats = _bosminer_query(ip, "stats", t, port=port, req_id=4)
                 power = _first_number(stats, ["power", "watts", "power_w"])
             except Exception:
                 power = None
@@ -1199,152 +1199,6 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
         print(f"[bosminer_papi] poll failed for {ip}:{port}: {e}")
         return False, None, str(e)
 
-
-
-
-# ------------------------------
-# Braiins OS Public API (gRPC)
-# ------------------------------
-
-def _which(cmd: str) -> Optional[str]:
-    try:
-        from shutil import which
-        return which(cmd)
-    except Exception:
-        return None
-
-
-def _grpcurl_call(
-    ip: str,
-    service_method: str,
-    timeout_s: float,
-    data: Optional[Dict[str, Any]] = None,
-    token: Optional[str] = None,
-    port: int = 50051,
-) -> Dict[str, Any]:
-    """Call BOS Public API via `grpcurl` (reflection-enabled on BOS).
-
-    We intentionally depend on the `grpcurl` binary (not on compiled protobuf stubs)
-    to keep this project lightweight and easy to deploy.
-
-    Returns parsed JSON dict. Raises on error.
-    """
-    if not _which("grpcurl"):
-        raise RuntimeError("grpcurl not installed in container")
-
-    cmd = ["grpcurl", "-plaintext", "-max-time", str(float(timeout_s))]
-    if token:
-        cmd += ["-H", f"authorization: Bearer {token}"]
-    if data is not None:
-        cmd += ["-d", json.dumps(data)]
-    cmd += [f"{ip}:{int(port)}", service_method]
-
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 1.0)
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"grpcurl timeout: {e}") from e
-
-    if p.returncode != 0:
-        err = (p.stderr or p.stdout or "").strip()
-        raise RuntimeError(err[:600] if err else "grpcurl failed")
-
-    out = (p.stdout or "").strip()
-    if not out:
-        return {}
-    try:
-        return json.loads(out)
-    except Exception as e:
-        # grpcurl sometimes prints non-JSON on stderr; keep stdout best-effort
-        raise RuntimeError(f"grpcurl returned non-JSON: {out[:200]}") from e
-
-
-def _braiins_grpc_login(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Login and return bearer token."""
-    user = cfg.get("rest_username")
-    pw = cfg.get("rest_password")
-    if not user or not pw:
-        return False, None, "missing username/password"
-    port = int(cfg.get("grpc_port") or 50051)
-    try:
-        resp = _grpcurl_call(
-            ip,
-            "braiins.bos.v1.AuthenticationService/Login",
-            timeout_s=timeout_s,
-            data={"username": str(user), "password": str(pw)},
-            token=None,
-            port=port,
-        )
-        token = resp.get("token")
-        if not token:
-            return False, None, "no token in LoginResponse"
-        return True, str(token), None
-    except Exception as e:
-        return False, None, str(e)
-
-
-def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    """Best-effort enrichment via Braiins OS Public gRPC API.
-
-    This is *additive*: failure here should not mark the miner offline if PAPI works.
-    """
-    port = int(cfg.get("grpc_port") or 50051)
-    ok, token, err = _braiins_grpc_login(ip, min(timeout_s, 2.5), cfg)
-    if not ok or not token:
-        return False, None, err or "login failed"
-
-    extra: Dict[str, Any] = {"braiins_grpc": {"port": port}}
-
-    # Api version (cheap sanity check)
-    try:
-        v = _grpcurl_call(ip, "braiins.bos.ApiVersionService/GetApiVersion", timeout_s=min(timeout_s, 2.0), data={}, token=token, port=port)
-        extra["braiins_grpc"]["api_version"] = v
-    except Exception as e:
-        extra["braiins_grpc"]["api_version_error"] = str(e)
-
-    # Cooling (fans + highest temp) - commonly useful and stable
-    try:
-        cool = _grpcurl_call(ip, "braiins.bos.v1.CoolingService/GetCoolingState", timeout_s=min(timeout_s, 2.2), data={}, token=token, port=port)
-        extra["braiins_grpc"]["cooling_state"] = cool
-
-        # Pull out simple fields for dashboard convenience
-        fans = cool.get("fans") or []
-        if isinstance(fans, list) and fans:
-            rpms = []
-            for f in fans:
-                rpm = _first_number(f, ["rpm"])
-                if rpm is not None:
-                    rpms.append(rpm)
-            if rpms:
-                extra["fanRPM"] = float(sum(rpms) / len(rpms))
-                extra["fanRPMs"] = [float(x) for x in rpms]
-
-        # Highest temp often nested like highest_temperature.temperature.degree_c
-        ht = cool.get("highestTemperature") or cool.get("highest_temperature")
-        t_c = None
-        if isinstance(ht, dict):
-            # common shapes:
-            # {"temperature":{"degree_c":59.5}} or {"temperature":{"degreeC":...}}
-            t_c = _first_number(ht, ["degree_c", "degreec", "degc", "temperature", "temp"])
-        if t_c is not None:
-            extra["temp"] = float(t_c)
-    except Exception as e:
-        extra["braiins_grpc"]["cooling_error"] = str(e)
-
-    # Pool service (optional)
-    try:
-        pools = _grpcurl_call(ip, "braiins.bos.v1.PoolService/GetPools", timeout_s=min(timeout_s, 2.2), data={}, token=token, port=port)
-        extra["braiins_grpc"]["pools"] = pools
-    except Exception as e:
-        extra["braiins_grpc"]["pools_error"] = str(e)
-
-    # Performance / tuner state (optional)
-    try:
-        tuner = _grpcurl_call(ip, "braiins.bos.v1.PerformanceService/GetTunerState", timeout_s=min(timeout_s, 2.2), data={}, token=token, port=port)
-        extra["braiins_grpc"]["tuner_state"] = tuner
-    except Exception as e:
-        extra["braiins_grpc"]["tuner_error"] = str(e)
-
-    return True, extra, None
 
 def _probe_braiins_rest(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     """Detect Braiins OS REST API via /api/v1/miner/details over http/https.
@@ -1679,30 +1533,14 @@ def _fetch_system_info(
     if pt in ("braiins", "braiins_rest", "bos_rest", "bos_api", "rest"):
         cfg = _merge_braiins_cfg(device_cfg)
         ok, info, err = _poll_braiins_rest(ip, timeout_s, cfg, None)
-        if ok:
-            return ok, info, err, "braiins_rest"
-        # REST isn't always available/enabled; fall back to BOSminer PAPI so the miner doesn't look 'offline'.
-        ok_p, info_p, err_p = _poll_bosminer_papi(ip, timeout_s, cfg)
-        if ok_p:
-            if isinstance(info_p, dict) and err:
-                info_p["rest_error"] = err
-            # Best-effort gRPC enrichment when creds exist
-            try:
-                if cfg.get("rest_username") and cfg.get("rest_password"):
-                    ok_g, extra_g, err_g = _poll_braiins_grpc(ip, min(timeout_s, 3.0), cfg)
-                    if ok_g and isinstance(extra_g, dict):
-                        info_p.update(extra_g)
-                    elif err_g:
-                        info_p.setdefault("braiins_grpc", {})["error"] = err_g
-            except Exception:
-                pass
-            return ok_p, info_p, err_p, "bosminer_papi"
         return ok, info, err, "braiins_rest"
 
     # Explicit BOSminer/Braiins legacy PAPI polling
     if pt in ("bosminer", "bosminer_papi", "braiins_papi", "papi"):
         cfg = _merge_braiins_cfg(device_cfg)
         ok, info, err = _poll_bosminer_papi(ip, timeout_s, cfg)
+        if not ok and err:
+            logger.warning("BOSminer poll failed ip=%s err=%s", ip, err)
         return ok, info, err, "bosminer_papi"
 
     # Explicit Avalon polling
@@ -1726,25 +1564,13 @@ def _fetch_system_info(
     # Auto-detect:
     # 1) Try the most specific protocols first (TCP miners), then REST, then HTTP.
     cfg = _merge_braiins_cfg(device_cfg)
-    quick = max(0.15, min(0.45, timeout_s))
+    quick = max(0.9, min(1.5, (timeout_s or 1.2) * 0.9))
 
     # BOSminer/Braiins PAPI (JSON over TCP/4028)
     ok_papi, _meta_p, err_papi = _probe_bosminer_papi(ip, quick, cfg)
     if ok_papi:
         ok_full, info_p, err_full = _poll_bosminer_papi(ip, timeout_s, cfg)
-        # Best-effort gRPC enrichment when creds exist
-        if ok_full and isinstance(info_p, dict):
-            try:
-                cfg_g = _merge_braiins_cfg(cfg)
-                if cfg_g.get('rest_username') and cfg_g.get('rest_password'):
-                    ok_g, extra_g, err_g = _poll_braiins_grpc(ip, min(timeout_s, 3.0), cfg_g)
-                    if ok_g and isinstance(extra_g, dict):
-                        info_p.update(extra_g)
-                    elif err_g:
-                        info_p.setdefault('braiins_grpc', {})['error'] = err_g
-            except Exception:
-                pass
-        return ok_full, info_p, err_full, 'bosminer_papi'
+        return ok_full, info_p, err_full, "bosminer_papi"
 
     # Avalon cgminer (TCP/4028 pipe protocol)
     ok_probe, _ver, err_a = _probe_avalon_q(ip, quick)
