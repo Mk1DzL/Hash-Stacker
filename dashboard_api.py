@@ -2,6 +2,19 @@
 # dashboard_api.py
 from __future__ import annotations
 
+
+# Default per-device configuration. Kept minimal; device-specific overrides live in dashboard_devices.config_json.
+DEFAULT_DEVICE_CFG: Dict[str, Dict[str, Any]] = {
+    "braiins": {
+        # Braiins OS LAN devices: gRPC Public API primary, BOSminer PAPI fallback
+        "grpc_port": 50051,
+        "grpc_username": "root",
+        "grpc_password": "",
+        "papi_port": 4028,
+    }
+}
+
+
 from fastapi import APIRouter, HTTPException, UploadFile, File, Body, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
