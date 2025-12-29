@@ -33,10 +33,14 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import logging
 
 import db
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+log = logging.getLogger("hash_stacker.dashboard")
+
 
 # Resolve all on-disk paths relative to this file (not the process CWD). This
 # avoids accidental "multiple DB/files" situations in Docker/Portainer.
@@ -404,6 +408,22 @@ def _save_settings(settings: Dict[str, Any]) -> None:
 class DeviceCreate(BaseModel):
     ip: str = Field(..., description="IPv4/IPv6 address")
     name: Optional[str] = None
+
+    # Optional: allow client to set/override poll type ("auto", "http", "avalon_cgminer", "braiins_grpc", "bosminer_papi")
+    poll_type: Optional[str] = None
+
+    # Optional auth fields (used by Braiins OS gRPC + other future integrations)
+    username: Optional[str] = None
+    password: Optional[str] = None
+    grpc_username: Optional[str] = None
+    grpc_password: Optional[str] = None
+    grpc_port: Optional[int] = None
+
+    # Optional free-form per-device config (stored in dashboard_devices.config_json)
+    config: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "allow"
 
 
 class SettingsUpdate(BaseModel):
@@ -1027,7 +1047,9 @@ def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[
                 cp = _run_get_stats(f"authorization: Bearer {token}")
 
         if cp.returncode != 0:
-            return False, None, (cp.stderr or cp.stdout or "grpcurl GetMinerStats failed").strip()
+            msg = (cp.stderr or cp.stdout or "grpcurl GetMinerStats failed").strip()
+            log.info("braiins grpc GetMinerStats failed ip=%s rc=%s msg=%s", ip, cp.returncode, msg)
+            return False, None, msg
         stats = json.loads(cp.stdout or "{}")
 
         def _get(path, default=None):
@@ -1705,12 +1727,33 @@ def api_add_device(payload: DeviceCreate):
     cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM dashboard_devices;")
     next_order = int(cur.fetchone()["next_order"])
     try:
+        # Build per-device config JSON from payload (so credentials are actually saved)
+        cfg: Dict[str, Any] = {}
+        if payload.config and isinstance(payload.config, dict):
+            cfg.update(payload.config)
+
+        # Accept either generic username/password or grpc_* fields
+        if payload.username is not None:
+            cfg.setdefault("grpc_username", payload.username)
+        if payload.password is not None:
+            cfg.setdefault("grpc_password", payload.password)
+        if payload.grpc_username is not None:
+            cfg["grpc_username"] = payload.grpc_username
+        if payload.grpc_password is not None:
+            cfg["grpc_password"] = payload.grpc_password
+        if payload.grpc_port is not None:
+            cfg["grpc_port"] = int(payload.grpc_port)
+
+        poll_type_in = (payload.poll_type or "auto").strip().lower()
+        if poll_type_in == "braiins":
+            poll_type_in = "braiins_grpc"
+
         cur.execute(
             """
-            INSERT INTO dashboard_devices (name, ip, created_at, sort_order, poll_type)
-            VALUES (?, ?, ?, ?, ?);
+            INSERT INTO dashboard_devices (name, ip, created_at, sort_order, poll_type, config_json)
+            VALUES (?, ?, ?, ?, ?, ?);
             """,
-            (payload.name, ip, now, next_order, "auto"),
+            (payload.name, ip, now, next_order, poll_type_in, json.dumps(cfg) if cfg else None),
         )
         conn.commit()
     except sqlite3.IntegrityError:  # type: ignore[name-defined]
@@ -1798,7 +1841,16 @@ def api_poll_status(
     def work(d: Dict[str, Any]) -> Dict[str, Any]:
         pt = (d.get("poll_type") or "auto")
         cfg = _parse_device_cfg(d)
+
+        log.debug("poll start ip=%s id=%s poll_type=%s cfg_keys=%s", d.get("ip"), d.get("id"), pt, sorted(list(cfg.keys())))
+
         ok, info, err, detected = _fetch_system_info(d["ip"], timeout, poll_type=pt, device_cfg=cfg)
+
+        if not ok:
+            log.info("poll fail ip=%s id=%s detected=%s err=%s", d.get("ip"), d.get("id"), detected, err)
+        else:
+            log.debug("poll ok ip=%s id=%s detected=%s", d.get("ip"), d.get("id"), detected)
+
         poll_update = detected if ok and detected in ("http", "avalon_cgminer", "braiins_grpc", "bosminer_papi") else None
         _write_device_poll(d["id"], ok, info, None if ok else err, poll_type=poll_update)
         latest = _get_latest_benchmark_for_ip(d["ip"])
