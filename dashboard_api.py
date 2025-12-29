@@ -390,8 +390,17 @@ def _save_settings(settings: Dict[str, Any]) -> None:
 
 
 class DeviceCreate(BaseModel):
+    # Frontend may send extra fields (legacy creds etc.) - allow extras.
+    model_config = {"extra": "allow"}
+
     ip: str = Field(..., description="IPv4/IPv6 address")
     name: Optional[str] = None
+
+    # Braiins OS credentials (used for gRPC)
+    braiins_username: Optional[str] = None
+    braiins_password: Optional[str] = None
+    grpc_username: Optional[str] = None
+    grpc_password: Optional[str] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -1407,6 +1416,7 @@ def _fetch_system_info(
     poll_type: str = "auto",
     device_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str], str]:
+    err_rest = None  # legacy REST removed; keep var to avoid NameError
     pt = (poll_type or "auto").strip().lower()
 
     # Braiins OS (LAN): gRPC primary, BOSminer PAPI fallback
@@ -1439,7 +1449,10 @@ def _fetch_system_info(
         try:
             r = requests.get(url, timeout=timeout_s)
             r.raise_for_status()
-            data = r.json()
+            try:
+                data = r.json()
+            except Exception as e:
+                return False, None, f"HTTP non-JSON response: {e}", "http"
             if not _looks_like_http_miner_payload(data):
                 return False, None, "Not a supported miner HTTP API", "http"
             return True, data, None, "http"
@@ -1627,48 +1640,54 @@ def api_list_devices():
 
 @router.post("/devices")
 def api_add_device(payload: DeviceCreate):
-    ip = _validate_ip(payload.ip)
-    conn = db._get_conn()
-    cur = conn.cursor()
-    now = _utcnow_iso()
-    # put at end
-    cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM dashboard_devices;")
-    next_order = int(cur.fetchone()["next_order"])
-    try:
-        cur.execute(
-            """
-            INSERT INTO dashboard_devices (name, ip, created_at, sort_order, poll_type)
-            VALUES (?, ?, ?, ?, ?);
-            """,
-            (payload.name, ip, now, next_order, "auto"),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:  # type: ignore[name-defined]
-        conn.close()
-        raise HTTPException(status_code=409, detail="Device already exists")
+    ip = (payload.ip or "").strip()
+    if not ip:
+        raise HTTPException(status_code=400, detail="Missing ip")
 
-    poll_type_final = "auto"
+    name = payload.name
 
-    # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
-    # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
+    # Per-device config (Braiins gRPC creds, ports)
+    cfg: Dict[str, Any] = {}
+    u = payload.grpc_username or payload.braiins_username
+    p = payload.grpc_password or payload.braiins_password
+
+    # Legacy extras (if frontend still posts rest_username/rest_password)
     try:
-        ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
-        if ok_a:
-            cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
-            conn.commit()
-            poll_type_final = "avalon_cgminer"
+        extra = payload.__pydantic_extra__ or {}
     except Exception:
-        pass
+        extra = {}
 
+    if not u:
+        u = extra.get("rest_username") or extra.get("username")
+    if not p:
+        p = extra.get("rest_password") or extra.get("password")
+
+    if u:
+        cfg["grpc_username"] = str(u)
+    if p:
+        cfg["grpc_password"] = str(p)
+
+    cfg["grpc_port"] = int(extra.get("grpc_port") or 50051)
+    cfg["papi_port"] = int(extra.get("papi_port") or 4028)
+
+    config_json = json.dumps(cfg) if cfg else None
+
+    con = _db_conn()
+    cur = con.cursor()
+
+    now = int(time.time())
+    row = cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM dashboard_devices;").fetchone()
+    next_order = int(row[0] if row and row[0] is not None else 1)
+
+    # poll_type "auto" lets us probe BitAxe HTTP, Braiins gRPC/BOSminer PAPI, Avalon cgminer.
+    cur.execute(
+        'INSERT INTO dashboard_devices (name, ip, created_at, sort_order, poll_type, config_json) VALUES (?, ?, ?, ?, ?, ?);',
+        (name, ip, now, next_order, "auto", config_json),
+    )
+    con.commit()
     device_id = cur.lastrowid
-    conn.close()
-    return {
-        "status": "ok",
-        "device": {"id": device_id, "ip": ip, "name": payload.name, "sort_order": next_order, "poll_type": poll_type_final},
-    }
-
-
-
+    con.close()
+    return {"ok": True, "id": device_id}
 
 @router.delete("/devices/{device_id}")
 def api_delete_device(device_id: int):
