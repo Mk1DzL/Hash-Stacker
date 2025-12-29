@@ -973,8 +973,8 @@ def _probe_braiins_grpc(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
 def _braiins_grpc_login(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str]]:
     """Login and return token (token passed as 'authorization: <token>')."""
     port = int(cfg.get("grpc_port") or 50051)
-    username = str(cfg.get("grpc_username") or "root")
-    password = str(cfg.get("grpc_password") or "")
+    username = str(cfg.get("grpc_username") or cfg.get("username") or (cfg.get("auth") or {}).get("username") or "root")
+    password = str(cfg.get("grpc_password") or cfg.get("password") or cfg.get("pass") or (cfg.get("auth") or {}).get("password") or "")
     if not password:
         return False, None, "Missing gRPC password"
     payload = json.dumps({"username": username, "password": password})
@@ -1003,12 +1003,29 @@ def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[
         return False, None, err
     port = int(cfg.get("grpc_port") or 50051)
     try:
-        cp = subprocess.run(
-            ["grpcurl", "-plaintext", "-H", f"authorization: {token}", "-d", "{}", f"{ip}:{port}", "braiins.bos.v1.MinerService/GetMinerStats"],
-            capture_output=True,
-            text=True,
-            timeout=max(float(timeout_s or 1.2), 3.5),
-        )
+        def _run_get_stats(header: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [
+                    "grpcurl",
+                    "-plaintext",
+                    "-H", header,
+                    "-d", "{}",
+                    f"{ip}:{port}",
+                    "braiins.bos.v1.MinerService/GetMinerStats",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=max(float(timeout_s or 1.2), 3.5),
+            )
+
+        # Braiins OS expects the token in the "authorization" header. Some builds accept
+        # raw token; others expect a Bearer token. Try raw first, then Bearer.
+        cp = _run_get_stats(f"authorization: {token}")
+        if cp.returncode != 0:
+            msg = (cp.stderr or cp.stdout or "").lower()
+            if ("unauth" in msg) or ("permission" in msg) or ("denied" in msg):
+                cp = _run_get_stats(f"authorization: Bearer {token}")
+
         if cp.returncode != 0:
             return False, None, (cp.stderr or cp.stdout or "grpcurl GetMinerStats failed").strip()
         stats = json.loads(cp.stdout or "{}")
@@ -1101,6 +1118,22 @@ def _merge_braiins_cfg(device_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     # normalize ports
     cfg["papi_port"] = int(cfg.get("papi_port") or 4028)
     cfg["grpc_port"] = int(cfg.get("grpc_port") or 50051)
+
+    
+    # accept common credential keys from UI / legacy configs
+    # (the web GUI typically stores generic 'username'/'password' fields)
+    if not cfg.get("grpc_username"):
+        if cfg.get("username"):
+            cfg["grpc_username"] = cfg.get("username")
+        elif isinstance(cfg.get("auth"), dict) and cfg["auth"].get("username"):
+            cfg["grpc_username"] = cfg["auth"].get("username")
+    if not cfg.get("grpc_password"):
+        if cfg.get("password"):
+            cfg["grpc_password"] = cfg.get("password")
+        elif cfg.get("pass"):
+            cfg["grpc_password"] = cfg.get("pass")
+        elif isinstance(cfg.get("auth"), dict) and cfg["auth"].get("password"):
+            cfg["grpc_password"] = cfg["auth"].get("password")
 
     # normalize auth fields (optional; gRPC requires password to fetch metrics)
     cfg["grpc_username"] = str(cfg.get("grpc_username") or "root")
