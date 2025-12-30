@@ -35,6 +35,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+
+import logging
+logger = logging.getLogger("dashboard_api")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
 import db
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -1243,6 +1249,45 @@ def _extract_temperature(value: Any) -> Optional[float]:
     return None
 
 
+
+def _json_extract_last_obj(txt: str) -> Any:
+    """Extract the last JSON object from a string that may contain multiple concatenated JSON blobs.
+
+    Some cgminer/BOSminer endpoints reply with multiple JSON objects back-to-back (or with junk banners),
+    which triggers json.loads() errors like 'Extra data'. This function walks the string with a JSONDecoder
+    and returns the last successfully decoded JSON value.
+    """
+    if not txt:
+        raise ValueError("Empty response")
+    # Try line-based first (many implementations send one JSON per line).
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    for cand in reversed(lines):
+        try:
+            return json.loads(cand)
+        except Exception:
+            continue
+    # Fall back to streaming decode across the whole buffer.
+    dec = json.JSONDecoder()
+    i = 0
+    last = None
+    n = len(txt)
+    while i < n:
+        # skip whitespace and obvious separators
+        while i < n and txt[i] in " \t\r\n\0":
+            i += 1
+        if i >= n:
+            break
+        try:
+            obj, end = dec.raw_decode(txt, i)
+            last = obj
+            i = end
+        except Exception:
+            # advance one char and keep scanning
+            i += 1
+    if last is None:
+        raise ValueError("No JSON object found")
+    return last
+
 def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, req_id: int = 1) -> Dict[str, Any]:
     """BOSminer/Braiins PAPI: JSON command over TCP (usually port 4028)."""
     payload = json.dumps({"command": command, "id": req_id}) + "\n"
@@ -1261,20 +1306,15 @@ def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, r
             buf += chunk
             if len(buf) > 2_000_000:
                 break
-    txt = buf.decode("utf-8", errors="replace").strip()
-    # sometimes there may be extra lines; try last JSON object
-    candidates = [t for t in txt.splitlines() if t.strip()]
-    if not candidates:
-        raise RuntimeError("Empty response")
-    last = candidates[-1]
-    try:
-        data = json.loads(last)
-    except Exception:
-        # fallback to entire buffer
-        data = json.loads(txt)
-    if not isinstance(data, dict):
-        raise RuntimeError("Unexpected response type")
-    return data
+    
+txt = buf.decode("utf-8", errors="replace").strip()
+try:
+    data = _json_extract_last_obj(txt)
+except Exception as e:
+    raise RuntimeError(f"Unexpected response: {e}") from e
+if not isinstance(data, dict):
+    raise RuntimeError("Unexpected response type")
+return data
 
 
 def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
@@ -1530,34 +1570,50 @@ def _fetch_system_info(
         except Exception as e:
             return False, None, str(e), "http"
 
-    # Auto-detect:
-    # 1) Try the most specific protocols first (TCP miners), then REST, then HTTP.
-    cfg = _merge_braiins_cfg(device_cfg)
-    quick = max(0.9, min(1.5, (timeout_s or 1.2) * 0.9))
+    
+# Auto-detect:
+# 1) Try the most specific protocols first (TCP miners), then gRPC, then HTTP.
+cfg = _merge_braiins_cfg(device_cfg)
+quick = max(0.9, min(1.5, (timeout_s or 1.2) * 0.9))
 
-    # BOSminer/Braiins PAPI (JSON over TCP/4028)
-    ok_papi, _meta_p, err_papi = _probe_bosminer_papi(ip, quick, cfg)
-    if ok_papi:
-        ok_full, info_p, err_full = _poll_bosminer_papi(ip, timeout_s, cfg)
-        return ok_full, info_p, err_full, "bosminer_papi"
+# If the user provided Braiins creds, prefer gRPC first. This prevents mis-detecting
+# Braiins OS as BOSminer PAPI on port 4028 (which often returns non-JSON / mixed output).
+has_grpc_creds = bool(str(cfg.get("grpc_password") or "").strip() or str(cfg.get("grpc_username") or "").strip())
 
-    # Avalon cgminer (TCP/4028 pipe protocol)
-    ok_probe, _ver, err_a = _probe_avalon_q(ip, quick)
-    if ok_probe:
-        ok_full, info_a, err_full = _poll_avalon_q(ip, timeout_s)
-        return ok_full, info_a, err_full, "avalon_cgminer"
-
-    # Braiins OS gRPC (primary) + BOSminer PAPI fallback
+if has_grpc_creds:
     ok_grpc, grpc_meta, err_grpc = _probe_braiins_grpc(ip, quick, cfg)
     if ok_grpc:
         ok_full, info_g, err_full = _poll_braiins_grpc(ip, timeout_s, cfg)
         if ok_full:
             return ok_full, info_g, err_full, "braiins_grpc"
-        # If auth/metrics fail, fall back to PAPI
+        # If auth/metrics fail, fall back to PAPI (some BOS builds expose it)
         ok_p, info_p, err_p = _poll_bosminer_papi(ip, timeout_s, cfg)
         if ok_p:
             return ok_p, info_p, None, "bosminer_papi"
         return False, None, err_full or err_p or err_grpc, "braiins_grpc"
+
+# BOSminer/Braiins PAPI (JSON over TCP/4028)
+ok_papi, _meta_p, err_papi = _probe_bosminer_papi(ip, quick, cfg)
+if ok_papi:
+    ok_full, info_p, err_full = _poll_bosminer_papi(ip, timeout_s, cfg)
+    return ok_full, info_p, err_full, "bosminer_papi"
+
+# Avalon cgminer (TCP/4028 pipe protocol)
+ok_probe, _ver, err_a = _probe_avalon_q(ip, quick)
+if ok_probe:
+    ok_full, info_a, err_full = _poll_avalon_q(ip, timeout_s)
+    return ok_full, info_a, err_full, "avalon_cgminer"
+
+# Braiins OS gRPC (primary) + BOSminer PAPI fallback
+ok_grpc, grpc_meta, err_grpc = _probe_braiins_grpc(ip, quick, cfg)
+if ok_grpc:
+    ok_full, info_g, err_full = _poll_braiins_grpc(ip, timeout_s, cfg)
+    if ok_full:
+        return ok_full, info_g, err_full, "braiins_grpc"
+    ok_p, info_p, err_p = _poll_bosminer_papi(ip, timeout_s, cfg)
+    if ok_p:
+        return ok_p, info_p, None, "bosminer_papi"
+    return False, None, err_full or err_p or err_grpc, "braiins_grpc"
 
     # Finally try BitAxe-style HTTP
     url = f"http://{ip}/api/system/info"
@@ -1724,37 +1780,58 @@ def api_add_device(payload: DeviceCreate):
     cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM dashboard_devices;")
     next_order = int(cur.fetchone()["next_order"])
     # normalize poll_type + pack protocol config
-    poll_type_final = (payload.poll_type or "auto").strip().lower()
-    if poll_type_final not in ("auto", "http", "avalon_cgminer", "bosminer_papi", "braiins_grpc"):
-        poll_type_final = "auto"
-    # If user provided Braiins gRPC credentials but left poll_type as auto,
-    # prefer Braiins gRPC (it will still fall back to BOSminer PAPI inside the poller if needed).
-    if poll_type_final == "auto" and (payload.grpc_username or payload.grpc_password):
-        poll_type_final = "braiins_grpc"
+    
+poll_type_final = (payload.poll_type or "auto").strip().lower()
+if poll_type_final not in ("auto", "http", "avalon_cgminer", "bosminer_papi", "braiins_grpc"):
+    poll_type_final = "auto"
 
-    cfg: Dict[str, Any] = {}
-    if payload.grpc_username:
-        cfg["grpc_username"] = payload.grpc_username
-    if payload.grpc_password:
-        cfg["grpc_password"] = payload.grpc_password
-    if payload.grpc_port:
-        cfg["grpc_port"] = int(payload.grpc_port)
-    if payload.papi_port:
-        cfg["papi_port"] = int(payload.papi_port)
-    # Preserve any extra fields sent by clients (bounded)
-    for k, v in getattr(payload, "__dict__", {}).items():
-        if k in ("ip", "name", "poll_type", "grpc_username", "grpc_password", "grpc_port", "papi_port"):
+# Pydantic v1/v2 compatibility: get the raw payload as a dict including extras.
+try:
+    payload_dict = payload.dict()  # type: ignore[attr-defined]
+except Exception:
+    try:
+        payload_dict = payload.model_dump()  # type: ignore[attr-defined]
+    except Exception:
+        payload_dict = dict(getattr(payload, "__dict__", {}) or {})
+
+# The web UI historically posts Braiins creds as generic fields (username/password) rather than grpc_*
+ui_user = payload_dict.get("grpc_username") or payload_dict.get("braiins_username") or payload_dict.get("username")
+ui_pass = payload_dict.get("grpc_password") or payload_dict.get("braiins_password") or payload_dict.get("password") or payload_dict.get("pass")
+
+# If user provided Braiins credentials but left poll_type as auto, force gRPC polling.
+if poll_type_final == "auto" and (ui_user or ui_pass):
+    poll_type_final = "braiins_grpc"
+
+cfg: Dict[str, Any] = {}
+
+# Normalize creds into grpc_* keys so the poller can use them consistently.
+if ui_user:
+    cfg["grpc_username"] = str(ui_user)
+if ui_pass:
+    cfg["grpc_password"] = str(ui_pass)
+
+# Optional ports (advanced)
+if payload.grpc_port:
+    cfg["grpc_port"] = int(payload.grpc_port)
+if payload.papi_port:
+    cfg["papi_port"] = int(payload.papi_port)
+
+# Preserve any extra fields sent by clients (bounded)
+for k, v in (payload_dict or {}).items():
+    if k in ("ip", "name", "poll_type", "grpc_username", "grpc_password", "grpc_port", "papi_port"):
+        continue
+    if v is None:
+        continue
+    if isinstance(v, (str, int, float, bool, dict, list)):
+        try:
+            s = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+        except Exception:
             continue
-        if v is None:
-            continue
-        if isinstance(v, (str, int, float, bool, dict, list)):
-            try:
-                s = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
-            except Exception:
-                continue
-            if len(s) <= 4096:
-                cfg[k] = v
-    config_json = json.dumps(cfg) if cfg else None
+        if len(s) <= 4096:
+            cfg[k] = v
+
+config_json = json.dumps(cfg) if cfg else None
+
     try:
         cur.execute(
             """
