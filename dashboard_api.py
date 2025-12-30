@@ -18,7 +18,6 @@ DEFAULT_DEVICE_CFG: Dict[str, Dict[str, Any]] = {
 from fastapi import APIRouter, HTTPException, UploadFile, File, Body, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from pydantic import ConfigDict, AliasChoices
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 import time
@@ -403,58 +402,23 @@ def _save_settings(settings: Dict[str, Any]) -> None:
     conn.close()
 
 
-
 class DeviceCreate(BaseModel):
-    """Payload for creating a device from the dashboard UI or API.
-
-    The dashboard UI historically used camelCase field names; we accept both snake_case and
-    camelCase to avoid silently dropping credentials (which caused devices to fall back to
-    auto/BOSminer probes and appear offline).
-    """
-
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
-
     ip: str = Field(..., description="IPv4/IPv6 address")
     name: Optional[str] = None
 
-    # Polling / protocol selection
-    poll_type: Optional[str] = Field(
-        default="auto",
-        validation_alias=AliasChoices("poll_type", "pollType"),
-        description="Polling protocol. Supported: auto, http, avalon_cgminer, bosminer_papi, braiins_grpc",
-    )
+    # Optional poll type override ("auto", "braiins_grpc", "bosminer_papi", etc.)
+    poll_type: Optional[str] = None
 
-    # Braiins OS gRPC auth (BOS+ / BOS)
-    grpc_username: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("grpc_username", "grpcUsername", "username", "user"),
-        description="Braiins OS gRPC username (e.g., root)",
-    )
-    grpc_password: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("grpc_password", "grpcPassword", "password", "pass"),
-        description="Braiins OS gRPC password",
-    )
+    # Optional per-device config payload from UI (e.g. {"braiins": {...}})
+    config: Optional[Dict[str, Any]] = None
 
-    # Optional ports (advanced)
-    grpc_port: Optional[int] = Field(
-        default=None,
-        validation_alias=AliasChoices("grpc_port", "grpcPort"),
-        ge=1,
-        le=65535,
-        description="gRPC port (default 50051)",
-    )
-    papi_port: Optional[int] = Field(
-        default=None,
-        validation_alias=AliasChoices("papi_port", "papiPort"),
-        ge=1,
-        le=65535,
-        description="BOSminer PAPI port (default 4028)",
-    )
+    # Convenience fields (UI/CLI may send these at top-level)
+    grpc_username: Optional[str] = None
+    grpc_password: Optional[str] = None
+
 
 
 class SettingsUpdate(BaseModel):
-
     settings: Dict[str, Any]
 
 
@@ -1132,6 +1096,17 @@ def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[
             "efficiency_j_per_th": to_f(jth),
             "accepted": to_f(acc),
             "rejected": to_f(rej),
+            # UI compatibility aliases (frontend historically expects BOSminer-style keys)
+            "sharesAccepted": to_f(acc),
+            "sharesRejected": to_f(rej),
+            "bestDiff": to_f(best),
+            "bestDiffEver": to_f(best),
+            "hashrate": to_f(g5s),
+            "hashrate_1m": to_f(g1m),
+            "hashrate_5m": to_f(g5m),
+            "hashrate_15m": to_f(g15m),
+            "hashrate_24h": to_f(g24h),
+            "hashrate_av": to_f(gavg),
             "bestShare": to_f(best),
             "lastDifficulty": to_f(lastdiff),
             "lastShareTime": lastshare,
@@ -1158,7 +1133,15 @@ def _merge_braiins_cfg(device_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     # merge per-device overrides (dashboard_devices.config_json)
     if device_cfg:
+        # device_cfg may either be a flat dict of overrides, or a nested {"braiins": {...}} payload from the UI.
+        if isinstance(device_cfg.get("braiins"), dict):
+            for k, v in device_cfg["braiins"].items():
+                if v is None:
+                    continue
+                cfg[k] = v
         for k, v in device_cfg.items():
+            if k == "braiins":
+                continue
             if v is None:
                 continue
             cfg[k] = v
@@ -1350,9 +1333,9 @@ def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]
 def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     port = int((cfg or {}).get("papi_port") or 4028)
     try:
-        summary = _bosminer_query(ip, "summary", timeout_s, port=port, req_id=1)
-        temps = _bosminer_query(ip, "temps", timeout_s, port=port, req_id=2)
-        fans = _bosminer_query(ip, "fans", timeout_s, port=port, req_id=3)
+        summary = _bosminer_query(ip, "summary", t, port=port, req_id=1)
+        temps = _bosminer_query(ip, "temps", t, port=port, req_id=2)
+        fans = _bosminer_query(ip, "fans", t, port=port, req_id=3)
 
         # summary parsing (BOSminer tends to mirror cgminer-ish keys)
         srow = None
@@ -1374,7 +1357,7 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
         if power is None:
             # some firmwares expose power under STATS/DEVS; try a quick fallback
             try:
-                stats = _bosminer_query(ip, "stats", timeout_s, port=port, req_id=4)
+                stats = _bosminer_query(ip, "stats", t, port=port, req_id=4)
                 power = _first_number(stats, ["power", "watts", "power_w"])
             except Exception:
                 power = None
@@ -1749,86 +1732,42 @@ def api_add_device(payload: DeviceCreate):
     conn = db._get_conn()
     cur = conn.cursor()
     now = _utcnow_iso()
+
+    poll_type_final = (payload.poll_type or "auto").strip().lower()
+
+    # Build per-device config blob (stored in dashboard_devices.config_json).
+    cfg: Dict[str, Any] = {}
+    if isinstance(payload.config, dict):
+        # defensive copy
+        cfg = json.loads(json.dumps(payload.config))
+
+    # Normalize/merge Braiins credential inputs from UI/CLI:
+    # - UI may post: {"config":{"braiins":{"rest_username":...,"rest_password":...}}}
+    # - CLI/curl may post: {"grpc_username":...,"grpc_password":...}
+    braiins_cfg: Dict[str, Any] = {}
+    if isinstance(cfg.get("braiins"), dict):
+        braiins_cfg = dict(cfg.get("braiins") or {})
+
+    # top-level convenience fields
+    if payload.grpc_username:
+        braiins_cfg.setdefault("grpc_username", payload.grpc_username)
+    if payload.grpc_password:
+        braiins_cfg.setdefault("grpc_password", payload.grpc_password)
+
+    # accept legacy/rest-named keys from UI
+    if braiins_cfg.get("rest_username") and not braiins_cfg.get("grpc_username"):
+        braiins_cfg["grpc_username"] = braiins_cfg.get("rest_username")
+    if braiins_cfg.get("rest_password") and not braiins_cfg.get("grpc_password"):
+        braiins_cfg["grpc_password"] = braiins_cfg.get("rest_password")
+
+    if braiins_cfg:
+        cfg["braiins"] = braiins_cfg
+
+    config_json = json.dumps(cfg) if cfg else None
+
     # put at end
     cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM dashboard_devices;")
     next_order = int(cur.fetchone()["next_order"])
-    # normalize poll_type + pack protocol config
-    poll_type_final = (payload.poll_type or "auto").strip().lower()
-    if poll_type_final not in ("auto", "http", "avalon_cgminer", "bosminer_papi", "braiins_grpc"):
-        poll_type_final = "auto"
-    # If user provided Braiins gRPC credentials but left poll_type as auto,
-    # prefer Braiins gRPC (it will still fall back to BOSminer PAPI inside the poller if needed).
-    if poll_type_final == "auto" and (payload.grpc_username or payload.grpc_password):
-        poll_type_final = "braiins_grpc"
-
-
-    cfg: Dict[str, Any] = {}
-
-    # Start with explicit (top-level) fields.
-    if payload.grpc_username:
-        cfg["grpc_username"] = payload.grpc_username
-    if payload.grpc_password:
-        cfg["grpc_password"] = payload.grpc_password
-    if payload.grpc_port:
-        cfg["grpc_port"] = int(payload.grpc_port)
-    if payload.papi_port:
-        cfg["papi_port"] = int(payload.papi_port)
-
-    # Pydantic v2 stores extra fields in model_dump(); v1 uses dict().
-    try:
-        dumped = payload.model_dump(exclude_none=True)  # type: ignore[attr-defined]
-    except Exception:
-        dumped = payload.dict(exclude_none=True)  # type: ignore[attr-defined]
-
-    # The Web UI currently posts creds under:
-    #   config: { braiins: { rest_username, rest_password, (optional) grpc_port } }
-    # Accept that schema and map it onto our gRPC fields.
-    braiins_cfg = None
-    cfg_obj = dumped.get("config")
-    if isinstance(cfg_obj, dict):
-        braiins_cfg = cfg_obj.get("braiins")
-
-    if isinstance(braiins_cfg, dict):
-        ui_user = braiins_cfg.get("grpc_username") or braiins_cfg.get("rest_username") or braiins_cfg.get("username")
-        ui_pass = braiins_cfg.get("grpc_password") or braiins_cfg.get("rest_password") or braiins_cfg.get("password")
-        ui_port = braiins_cfg.get("grpc_port") or braiins_cfg.get("port")
-
-        if ui_user and not cfg.get("grpc_username"):
-            cfg["grpc_username"] = str(ui_user)
-        if ui_pass and not cfg.get("grpc_password"):
-            cfg["grpc_password"] = str(ui_pass)
-        if ui_port and not cfg.get("grpc_port"):
-            try:
-                cfg["grpc_port"] = int(ui_port)
-            except Exception:
-                pass
-
-        # If creds exist and poll_type was left as auto, prefer braiins_grpc.
-        if poll_type_final == "auto" and (ui_user or ui_pass):
-            poll_type_final = "braiins_grpc"
-
-    # Also accept legacy extras posted at the top-level.
-    if dumped.get("rest_username") and not cfg.get("grpc_username"):
-        cfg["grpc_username"] = str(dumped.get("rest_username"))
-    if dumped.get("rest_password") and not cfg.get("grpc_password"):
-        cfg["grpc_password"] = str(dumped.get("rest_password"))
-
-    # Preserve any other extra fields sent by clients (bounded).
-    reserved = {"ip","name","poll_type","grpc_username","grpc_password","grpc_port","papi_port","rest_username","rest_password"}
-    for k, v in (dumped or {}).items():
-        if k in reserved:
-            continue
-        if v is None:
-            continue
-        if isinstance(v, (str, int, float, bool, dict, list)):
-            try:
-                s = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
-            except Exception:
-                continue
-            if len(s) <= 4096:
-                cfg[k] = v
-
-    config_json = json.dumps(cfg) if cfg else None
     try:
         cur.execute(
             """
@@ -1838,253 +1777,35 @@ def api_add_device(payload: DeviceCreate):
             (payload.name, ip, now, next_order, poll_type_final, config_json),
         )
         conn.commit()
-    except sqlite3.IntegrityError:  # type: ignore[name-defined]
-        conn.close()
+    except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Device already exists")
 
-    # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
-    # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
-    try:
-        ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
-        if ok_a:
-            cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
-            conn.commit()
-            poll_type_final = "avalon_cgminer"
-    except Exception:
-        pass
-
-    # Quick protocol hint for Braiins OS: if gRPC responds, set it immediately.
-    if poll_type_final == "auto":
-        try:
-            cfg_hint = {}
-            if payload.grpc_username:
-                cfg_hint["grpc_username"] = payload.grpc_username
-            if payload.grpc_password:
-                cfg_hint["grpc_password"] = payload.grpc_password
-            if payload.grpc_port:
-                cfg_hint["grpc_port"] = payload.grpc_port
-            ok_g, _meta, _errg = _probe_braiins_grpc(ip, 0.5, _merge_braiins_cfg(cfg_hint))
-            if ok_g:
-                cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("braiins_grpc", ip))
-                conn.commit()
-                poll_type_final = "braiins_grpc"
-        except Exception:
-            pass
-
-    device_id = cur.lastrowid
-    conn.close()
-    return {
-        "status": "ok",
-        "device": {"id": device_id, "ip": ip, "name": payload.name, "sort_order": next_order, "poll_type": poll_type_final},
-    }
+    cur.execute("SELECT * FROM dashboard_devices WHERE ip=?;", (ip,))
+    row = cur.fetchone()
+    return {"status": "ok", "device": _row_to_device(row)}
 
 
 
-
-@router.delete("/devices/{device_id}")
-def api_delete_device(device_id: int):
-    conn = db._get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM dashboard_devices WHERE id = ?;", (device_id,))
-    if cur.rowcount <= 0:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Device not found")
-    conn.commit()
-    conn.close()
-    return {"status": "deleted"}
-
-
-@router.post("/devices/reorder")
-def api_reorder_devices(payload: ReorderPayload):
-    ids = payload.device_ids or []
-    conn = db._get_conn()
-    cur = conn.cursor()
-
-    # Validate IDs exist
-    if ids:
-        cur.execute(
-            f"SELECT id FROM dashboard_devices WHERE id IN ({','.join(['?']*len(ids))});",
-            ids,
-        )
-        existing = {int(r["id"]) for r in cur.fetchall()}
-        missing = [i for i in ids if i not in existing]
-        if missing:
-            conn.close()
-            raise HTTPException(status_code=400, detail=f"Unknown device ids: {missing}")
-
-    for idx, did in enumerate(ids):
-        cur.execute("UPDATE dashboard_devices SET sort_order = ? WHERE id = ?;", (idx, did))
-
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-
-@router.get("/status")
-def api_poll_status(
-    timeout_s: Optional[float] = Query(None, ge=0.2, le=10.0),
-    parallel: int = Query(32, ge=1, le=128),
-):
+def _extract_last_json_object(text: str) -> str:
+    """Return the last complete JSON object found in a text blob.
+    BOSminer/cgminer-style APIs sometimes send multiple JSON objects back-to-back.
     """
-    Poll each saved device and return aggregated status (HTTP BitAxe-style API or Avalon cgminer TCP/4028).
-    Also updates the DB with last_poll/last_seen/last_info_json.
-    """
-    settings = _get_settings()
-    timeout = float(timeout_s if timeout_s is not None else settings.get("request_timeout_s", 1.2))
-
-    devices = _list_devices()
-    results: List[Dict[str, Any]] = []
-    now = _utcnow_iso()
-
-    def work(d: Dict[str, Any]) -> Dict[str, Any]:
-        pt = (d.get("poll_type") or "auto")
-        cfg = _parse_device_cfg(d)
-        ok, info, err, detected = _fetch_system_info(d["ip"], timeout, poll_type=pt, device_cfg=cfg)
-        poll_update = detected if ok and detected in ("http", "avalon_cgminer", "braiins_grpc", "bosminer_papi") else None
-        _write_device_poll(d["id"], ok, info, None if ok else err, poll_type=poll_update)
-        latest = _get_latest_benchmark_for_ip(d["ip"])
-        return {
-            "id": d["id"],
-            "ip": d["ip"],
-            "name": d.get("name"),
-            "poll_type": (poll_update or d.get("poll_type") or "http"),
-            "online": ok,
-            "info": info,
-            "error": err,
-            "last_poll": now,
-            "latest_benchmark": latest,
-        }
-
-    with ThreadPoolExecutor(max_workers=parallel) as ex:
-        futures = [ex.submit(work, d) for d in devices]
-        for f in as_completed(futures):
-            results.append(f.result())
-
-    # preserve sort order from DB
-    order = {d["id"]: (d.get("sort_order", 0), d["id"]) for d in devices}
-    results.sort(key=lambda r: order.get(r["id"], (10_000, r["id"])))
-
-    return {"now": now, "devices": results}
-
-
-@router.get("/debug")
-def api_debug():
-    """Return a lightweight diagnostic snapshot to help troubleshoot deployments.
-
-    This endpoint is intentionally read-only and avoids returning any secrets.
-    It is safe to share screenshots/output when reporting issues.
-    """
-    info: Dict[str, Any] = {
-        "ok": True,
-        "db_path": getattr(db, "DB_PATH", None),
-        "cwd": os.getcwd(),
-        "base_dir": _BASE_DIR,
-        "asset_root": ASSET_ROOT,
-        "bg_dir": BG_DIR,
-        "snd_dir": SND_DIR,
-    }
-
-    try:
-        conn = db._get_conn()
-        cur = conn.cursor()
-
-        cur.execute("PRAGMA database_list;")
-        info["sqlite_databases"] = [
-            {"seq": r[0], "name": r[1], "file": r[2]} for r in cur.fetchall()
-        ]
-
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
-        tables = [r[0] if not hasattr(r, "keys") else r["name"] for r in cur.fetchall()]
-        info["tables"] = tables
-
-        def table_info(table: str) -> Dict[str, Any]:
-            out: Dict[str, Any] = {"columns": []}
-            try:
-                cur.execute(f"PRAGMA table_info({table});")
-                cols = []
-                for row in cur.fetchall():
-                    # row = (cid, name, type, notnull, dflt_value, pk)
-                    cols.append(
-                        {
-                            "name": row[1],
-                            "type": row[2],
-                            "notnull": bool(row[3]),
-                            "default": row[4],
-                            "pk": bool(row[5]),
-                        }
-                    )
-                out["columns"] = cols
-                cur.execute(f"SELECT COUNT(*) FROM {table};")
-                out["row_count"] = int(cur.fetchone()[0])
-            except Exception as e:
-                out["error"] = f"{type(e).__name__}: {e}"
-            return out
-
-        # Focus on the tables relevant to the dashboard and benchmarks.
-        for t in ("dashboard_devices", "dashboard_settings", "dashboard_assets", "benchmark_runs", "profiles"):
-            if t in tables:
-                info[t] = table_info(t)
-
-        conn.close()
-    except Exception as e:
-        info["ok"] = False
-        info["error"] = f"{type(e).__name__}: {e}"
-
-    return info
-
-
-class ScanPayload(BaseModel):
-    cidr: str = Field(..., description="CIDR, e.g. 192.168.10.0/24")
-    timeout_s: float = Field(0.8, ge=0.2, le=10.0)
-    parallel: int = Field(64, ge=1, le=128)
-    limit: int = Field(512, ge=1, le=2048)
-
-
-@router.post("/scan")
-def api_scan(payload: ScanPayload):
-    """
-    Scan a CIDR for devices that respond to /api/system/info.
-    Returns a list of found systems (does NOT auto-add).
-    """
-    try:
-        net = ipaddress.ip_network(payload.cidr, strict=False)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {payload.cidr}") from e
-
-    hosts = [str(h) for h in net.hosts()]
-    if len(hosts) > payload.limit:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Refusing to scan {len(hosts)} hosts (limit {payload.limit}). Use a smaller CIDR or raise limit.",
-        )
-
-    found: List[Dict[str, Any]] = []
-    timeout = float(payload.timeout_s)
-
-    def probe(ip: str) -> Optional[Dict[str, Any]]:
-        ok, info, err, detected = _fetch_system_info(ip, timeout, poll_type='auto')
-        if not ok:
-            return None
-        if not _looks_like_supported_miner(detected, info):
-            return None
-        # attach a few convenient fields
-        if isinstance(info, dict):
-            hostname = info.get("hostname") or info.get("host") or None
-            model = info.get("deviceModel") or info.get("ASICModel") or None
-        else:
-            hostname, model = None, None
-        return {"ip": ip, "hostname": hostname, "model": model, "detected": detected, "info": info}
-
-    with ThreadPoolExecutor(max_workers=int(payload.parallel)) as ex:
-        futures = [ex.submit(probe, ip) for ip in hosts]
-        for f in as_completed(futures):
-            item = f.result()
-            if item:
-                found.append(item)
-
-    found.sort(key=lambda x: x.get("ip", ""))
-    return {"cidr": payload.cidr, "found": found, "count": len(found)}
-
+    if not text:
+        raise ValueError("empty response")
+    # Find last closing brace and walk backwards to matching opening brace.
+    end = text.rfind("}")
+    if end == -1:
+        raise ValueError("no JSON object end brace")
+    depth = 0
+    for i in range(end, -1, -1):
+        c = text[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            depth -= 1
+            if depth == 0:
+                return text[i : end + 1]
+    raise ValueError("no complete JSON object found")
 
 def _safe_filename(original: str, content: bytes) -> str:
     h = hashlib.sha256(content).hexdigest()[:16]
