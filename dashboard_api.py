@@ -1043,286 +1043,292 @@ def _braiins_grpc_login(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple
     except Exception as e:
         return False, None, str(e)
 
-def _poll_braiins_grpc_extras(ip: str, port: int, token: str, timeout_s: float) -> Dict[str, Any]:
-    """Fetch extra metrics via Braiins gRPC.
 
-    We keep this optional and best-effort so that the main stats poll (MinerService/GetMinerStats)
-    continues to work even if a device/firmware doesn't expose some endpoints.
-
-    Returns a dict that may contain: temp, boardTemp, fanspeed, fanrpm.
+def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     """
+    Poll Braiins OS via gRPC (grpcurl). Uses AuthenticationService/Login to obtain a token, then queries:
+      - MinerService/GetMinerStats (hashrate, shares, best share, difficulty)
+      - CoolingService/GetCoolingState (fans + temp)
+      - PoolService/GetPoolGroups (active pool/stratum config)
+      - MinerService/GetMinerStatus + GetMinerDetails (best-effort: uptime, hostname, version, found blocks)
+    NOTE: This implementation is intentionally defensive: different BOS versions may differ slightly in field names.
+    """
+    cfg = cfg or {}
+    # Accept both the UI's legacy braiins REST keys and the newer gRPC keys.
+    braiins_cfg = (cfg.get("braiins") or cfg.get("braiins_grpc") or cfg.get("grpc") or {}) if isinstance(cfg, dict) else {}
+    username = braiins_cfg.get("grpc_username") or braiins_cfg.get("username") or braiins_cfg.get("rest_username") or "root"
+    password = braiins_cfg.get("grpc_password") or braiins_cfg.get("password") or braiins_cfg.get("rest_password")
+    port = int(braiins_cfg.get("grpc_port") or 50051)
 
-    out: Dict[str, Any] = {}
+    if not password:
+        return False, None, "Missing gRPC password"
 
-    def _grpc_call_json(method: str, payload_json: str) -> Optional[Dict[str, Any]]:
-        cmd = [
-            "grpcurl",
-            "-plaintext",
-            "-d",
-            payload_json,
-        ]
-        # Braiins gRPC auth header appears to accept both raw token and Bearer token.
+    def _run(method: str, payload: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        cmd = ["grpcurl", "-plaintext", "-d", json.dumps(payload), f"{ip}:{port}", method]
         if token:
-            cmd += ["-H", f"authorization: {token}"]
-        cmd += [f"{ip}:{port}", method]
-
+            cmd.insert(2, "-H")
+            cmd.insert(3, f"authorization: {token}")
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=max(0.5, float(timeout_s)),
-            )
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(1.0, float(timeout_s)))
         except Exception as e:
-            logger.debug("[braiins_grpc] extras grpcurl failed: %s", e)
-            return None
-
-        if proc.returncode != 0:
-            # Some devices want Bearer prefix. Try once more.
-            if token and "Bearer" not in (proc.stderr or ""):
-                cmd2 = [
-                    "grpcurl",
-                    "-plaintext",
-                    "-H",
-                    f"authorization: Bearer {token}",
-                    "-d",
-                    payload_json,
-                    f"{ip}:{port}",
-                    method,
-                ]
-                try:
-                    proc2 = subprocess.run(
-                        cmd2,
-                        capture_output=True,
-                        text=True,
-                        timeout=max(0.5, float(timeout_s)),
-                    )
-                    if proc2.returncode == 0:
-                        proc = proc2
-                    else:
-                        logger.debug("[braiins_grpc] extras grpcurl nonzero: %s", (proc2.stderr or proc2.stdout or "").strip())
-                        return None
-                except Exception as e:
-                    logger.debug("[braiins_grpc] extras grpcurl retry failed: %s", e)
-                    return None
-            else:
-                logger.debug("[braiins_grpc] extras grpcurl nonzero: %s", (proc.stderr or proc.stdout or "").strip())
-                return None
-
-        raw = (proc.stdout or "").strip()
-        if not raw:
-            return None
+            raise RuntimeError(f"grpcurl failed ({method}): {e}")
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+        if p.returncode != 0:
+            raise RuntimeError(f"grpcurl rc={p.returncode} ({method}): {err or out}")
+        if not out:
+            return {}
         try:
-            return json.loads(raw)
+            return json.loads(out)
         except Exception:
-            # grpcurl should emit a single JSON object, but guard anyway.
-            try:
-                first_line = raw.splitlines()[0]
-                return json.loads(first_line)
-            except Exception:
-                logger.debug("[braiins_grpc] extras JSON parse failed (first 200): %r", raw[:200])
-                return None
-
-    # CoolingService exposes temps and fan states.
-    cooling = _grpc_call_json("braiins.bos.v1.CoolingService/GetCoolingState", "{}")
-    if isinstance(cooling, dict):
-        # temp / boardTemp
-        chip_temp = None
-        board_temp = None
-
-        ht = cooling.get("highestTemperature")
-        if isinstance(ht, dict):
-            t = ht.get("temperature")
-            if isinstance(t, dict) and "degreeC" in t:
+            # grpcurl sometimes prints extra lines; try to recover by taking the last JSON object
+            start = out.find("{")
+            if start >= 0:
                 try:
-                    chip_temp = float(t.get("degreeC"))
+                    return json.loads(out[start:])
                 except Exception:
                     pass
+            raise RuntimeError(f"Invalid JSON from grpcurl ({method}): {out[:200]}")
 
-        # Some firmwares may return a list of temperatures (schema varies).
-        temps = cooling.get("temperatures")
-        if isinstance(temps, list):
-            for item in temps:
-                if not isinstance(item, dict):
-                    continue
-                loc = str(item.get("location") or "")
-                t = item.get("temperature")
-                deg = None
-                if isinstance(t, dict) and "degreeC" in t:
-                    try:
-                        deg = float(t.get("degreeC"))
-                    except Exception:
-                        deg = None
-                if deg is None and "degreeC" in item:
-                    try:
-                        deg = float(item.get("degreeC"))
-                    except Exception:
-                        deg = None
+    def _get(obj: Any, *path: str, default=None):
+        cur = obj
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
 
-                if deg is None:
-                    continue
-                if "CHIP" in loc and (chip_temp is None or deg > chip_temp):
-                    chip_temp = deg
-                if "BOARD" in loc and (board_temp is None or deg > board_temp):
-                    board_temp = deg
+    # ----- token (cached) -----
+    now = time.time()
+    cache = _BRAIINS_TOKEN_CACHE.get(ip)
+    token = None
+    if cache and cache.get("token") and cache.get("expires_at", 0) > now + 30:
+        token = cache["token"]
+    else:
+        login = _run("braiins.bos.v1.AuthenticationService/Login", {"username": username, "password": password}, token=None)
+        token = login.get("token")
+        timeout_s_login = float(login.get("timeoutS") or 3600)
+        if not token:
+            return False, None, "gRPC login returned no token"
+        _BRAIINS_TOKEN_CACHE[ip] = {"token": token, "expires_at": now + timeout_s_login}
 
-        if chip_temp is not None:
-            out["temp"] = chip_temp
-        if board_temp is not None:
-            out["boardTemp"] = board_temp
+    # ----- Miner stats -----
+    stats = _run("braiins.bos.v1.MinerService/GetMinerStats", {}, token=token)
 
-        # fans
-        fans = cooling.get("fans")
-        if isinstance(fans, list) and fans:
-            rpms = []
-            ratios = []
-            for f in fans:
-                if not isinstance(f, dict):
-                    continue
-                if "rpm" in f:
-                    try:
-                        rpms.append(float(f.get("rpm")))
-                    except Exception:
-                        pass
-                if "targetSpeedRatio" in f:
-                    try:
-                        ratios.append(float(f.get("targetSpeedRatio")))
-                    except Exception:
-                        pass
+    pool_stats = stats.get("poolStats") or {}
+    miner_stats = stats.get("minerStats") or {}
+    power_stats = stats.get("powerStats") or {}
 
-            if rpms:
-                out["fanrpm"] = sum(rpms) / len(rpms)
-            if ratios:
-                # represent as percentage like the BOSminer path does (0..100)
-                out["fanspeed"] = max(ratios) * 100.0
-
-    return out
-
-
-def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    """Poll Braiins OS gRPC MinerService/GetMinerStats for rich metrics."""
-    ok, token, err = _braiins_grpc_login(ip, timeout_s, cfg)
-    if not ok:
-        return False, None, err
-    port = int(cfg.get("grpc_port") or 50051)
-    try:
-        def _run_get_stats(header: str) -> subprocess.CompletedProcess:
-            return subprocess.run(
-                [
-                    "grpcurl",
-                    "-plaintext",
-                    "-H", header,
-                    "-d", "{}",
-                    f"{ip}:{port}",
-                    "braiins.bos.v1.MinerService/GetMinerStats",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=max(float(timeout_s or 1.2), 3.5),
-            )
-
-        # Braiins OS expects the token in the "authorization" header. Some builds accept
-        # raw token; others expect a Bearer token. Try raw first, then Bearer.
-        cp = _run_get_stats(f"authorization: {token}")
-        if cp.returncode != 0:
-            msg = (cp.stderr or cp.stdout or "").lower()
-            if ("unauth" in msg) or ("permission" in msg) or ("denied" in msg):
-                cp = _run_get_stats(f"authorization: Bearer {token}")
-
-        if cp.returncode != 0:
-            return False, None, (cp.stderr or cp.stdout or "grpcurl GetMinerStats failed").strip()
-        stats = json.loads(cp.stdout or "{}")
-
-        def _get(path, default=None):
-            x = stats
-            for k in path:
-                if not isinstance(x, dict) or k not in x:
-                    return default
-                x = x[k]
-            return x
-
-        g5s = _get(["minerStats","realHashrate","last5s","gigahashPerSecond"])
-        g1m = _get(["minerStats","realHashrate","last1m","gigahashPerSecond"])
-        g5m = _get(["minerStats","realHashrate","last5m","gigahashPerSecond"])
-        g15m = _get(["minerStats","realHashrate","last15m","gigahashPerSecond"])
-        g24h = _get(["minerStats","realHashrate","last24h","gigahashPerSecond"])
-        gavg = _get(["minerStats","realHashrate","sinceRestart","gigahashPerSecond"])
-
-        watts = _get(["powerStats","approximatedConsumption","watt"])
-        jth = _get(["powerStats","efficiency","joulePerTerahash"])
-        acc = _get(["poolStats","acceptedShares"])
-        rej = _get(["poolStats","rejectedShares"])
-        best = _get(["poolStats","bestShare"])
-        lastdiff = _get(["poolStats","lastDifficulty"])
-        lastshare = _get(["poolStats","lastShareTime"])
-
-        def to_f(v):
-            try:
-                return float(v)
-            except Exception:
-                return None
-
-        def ghs_to_ths(v):
-            v = to_f(v)
-            return (v / 1000.0) if v is not None else None
-
-        info = {
-            "type": "Braiins OS (gRPC)",
-            "deviceModel": "Braiins OS",
-            "authRequired": True,
-            "grpc_port": port,
-            "hashRate": to_f(g5s),
-            "hashRate_1m": to_f(g1m),
-            "hashRate_5m": to_f(g5m),
-            "hashRate_15m": to_f(g15m),
-            "hashRate_24h": to_f(g24h),
-            "hashRate_avg": to_f(gavg),
-            "hashRate_THs": ghs_to_ths(g5s),
-            "hashRate_1m_THs": ghs_to_ths(g1m),
-            "hashRate_5m_THs": ghs_to_ths(g5m),
-            "hashRate_15m_THs": ghs_to_ths(g15m),
-            "hashRate_24h_THs": ghs_to_ths(g24h),
-            "hashRate_avg_THs": ghs_to_ths(gavg),
-            "power": to_f(watts),
-            "efficiency_j_per_th": to_f(jth),
-            "accepted": to_f(acc),
-            "rejected": to_f(rej),
-            "bestShare": to_f(best),
-            "lastDifficulty": to_f(lastdiff),
-            "lastShareTime": lastshare,
-            "last_seen": int(time.time()),
-            "hashrate": to_f(g5s),
-            "hashrate_1m": to_f(g1m),
-            "hashrate_5m": to_f(g5m),
-            "hashrate_15m": to_f(g15m),
-            "hashrate_24h": to_f(g24h),
-            "hashrate_avg": to_f(gavg),
-            "hashrate_ths": ghs_to_ths(g5s),
-            "sharesAccepted": to_f(acc),
-            "sharesRejected": to_f(rej),
-            "bestDiff": to_f(best),
-            "efficiency": to_f(jth),
-            "temp": None,
-            "boardTemp": None,
-            "fanspeed": None,
-            "fanrpm": None,
-            "hostname": None,
-            "version": None,
-            "_raw_grpc": stats,
-        }
-        # Optional richer metrics (temps/fans/hostname/version) via extra gRPC calls.
+    real = (miner_stats.get("realHashrate") or {})
+    def _ghps(bucket: str) -> Optional[float]:
+        v = _get(real, bucket, "gigahashPerSecond", default=None)
         try:
-            extra = _poll_braiins_grpc_extras(ip, port, token, timeout_s)
-            for k, v in extra.items():
-                if v is None:
-                    continue
-                info[k] = v
+            return float(v) if v is not None else None
         except Exception:
-            pass
+            return None
 
-        return True, info, None
-    except Exception as e:
-        return False, None, str(e)
+    gh_5s  = _ghps("last5s")
+    gh_1m  = _ghps("last1m")
+    gh_5m  = _ghps("last5m")
+    gh_15m = _ghps("last15m")
+    gh_24h = _ghps("last24h")
+    gh_avg = _ghps("sinceRestart")
+
+    # shares / diff / best share
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    accepted = _to_float(pool_stats.get("acceptedShares"))
+    rejected = _to_float(pool_stats.get("rejectedShares"))
+    last_diff = _to_float(pool_stats.get("lastDifficulty"))
+    best_share = _to_float(pool_stats.get("bestShare"))
+    last_share_time = pool_stats.get("lastShareTime")
+
+    power_w = _to_float(_get(power_stats, "approximatedConsumption", "watt", default=None))
+    eff = _to_float(_get(power_stats, "efficiency", "joulePerTerahash", default=None))
+
+    info: Dict[str, Any] = {
+        "type": "Braiins OS (gRPC)",
+        "deviceModel": "Braiins OS",
+        "authRequired": True,
+        "grpc_port": port,
+
+        # canonical
+        "hashRate": gh_5s,
+        "hashRate_1m": gh_1m,
+        "hashRate_5m": gh_5m,
+        "hashRate_15m": gh_15m,
+        "hashRate_24h": gh_24h,
+        "hashRate_avg": gh_avg,
+        "hashRate_THs": (gh_5s / 1000.0) if gh_5s is not None else None,
+        "hashRate_1m_THs": (gh_1m / 1000.0) if gh_1m is not None else None,
+        "hashRate_5m_THs": (gh_5m / 1000.0) if gh_5m is not None else None,
+        "hashRate_15m_THs": (gh_15m / 1000.0) if gh_15m is not None else None,
+        "hashRate_24h_THs": (gh_24h / 1000.0) if gh_24h is not None else None,
+        "hashRate_avg_THs": (gh_avg / 1000.0) if gh_avg is not None else None,
+
+        "power": power_w,
+        "efficiency_j_per_th": eff,
+        "accepted": accepted,
+        "rejected": rejected,
+        "bestShare": best_share,
+        "lastDifficulty": last_diff,
+        "lastShareTime": last_share_time,
+        "last_seen": int(time.time()),
+
+        # compatibility with BOSminer fields used by dashboard UI
+        "hashrate": gh_5s,
+        "hashrate_1m": gh_1m,
+        "hashrate_5m": gh_5m,
+        "hashrate_15m": gh_15m,
+        "hashrate_24h": gh_24h,
+        "hashrate_avg": gh_avg,
+        "hashrate_ths": (gh_5s / 1000.0) if gh_5s is not None else None,
+        "sharesAccepted": accepted,
+        "sharesRejected": rejected,
+        "bestDiff": best_share,
+        "efficiency": eff,
+
+        # filled in below if available
+        "temp": None,
+        "boardTemp": None,
+        "fanspeed": None,
+        "fanrpm": None,
+        "hostname": None,
+        "version": None,
+        "uptimeSeconds": None,
+        "foundBlocks": None,
+        "stratumURL": None,
+        "stratumPort": None,
+        "stratumUser": None,
+
+        "_raw_grpc": stats,
+    }
+
+    # ----- Cooling (temps + fans) -----
+    try:
+        cool = _run("braiins.bos.v1.CoolingService/GetCoolingState", {}, token=token)
+        fans = cool.get("fans") or []
+        if isinstance(fans, list) and fans:
+            rpms = [f.get("rpm") for f in fans if isinstance(f, dict) and f.get("rpm") is not None]
+            ratios = [f.get("targetSpeedRatio") for f in fans if isinstance(f, dict) and f.get("targetSpeedRatio") is not None]
+            if rpms:
+                info["fanrpm"] = float(sum(rpms)) / float(len(rpms))
+            if ratios:
+                info["fanspeed"] = (float(sum(ratios)) / float(len(ratios))) * 100.0
+        hi = cool.get("highestTemperature") or {}
+        temp_c = _get(hi, "temperature", "degreeC", default=None)
+        if temp_c is not None:
+            info["temp"] = float(temp_c)
+        info["_raw_grpc_cooling"] = cool
+    except Exception:
+        # Cooling is optional; keep nulls if unavailable
+        pass
+
+    # ----- Pool / Stratum -----
+    try:
+        pools = _run("braiins.bos.v1.PoolService/GetPoolGroups", {}, token=token)
+        # Shape varies; we try a few common layouts.
+        groups = pools.get("poolGroups") or []
+            # prefer active pool from the first pool group, else any enabled+alive pool
+            chosen = None
+            for g in groups:
+                for p in (g.get("pools") or []):
+                    if p.get("enabled") and p.get("active"):
+                        chosen = p
+                        break
+                if chosen:
+                    break
+            if not chosen:
+                for g in groups:
+                    for p in (g.get("pools") or []):
+                        if p.get("enabled") and p.get("alive"):
+                            chosen = p
+                            break
+                    if chosen:
+                        break
+
+            if chosen:
+                raw_url = (chosen.get("url") or "").strip()
+                # Strip common stratum URL schemes so we can split host/port reliably
+                raw_url_noscheme = re.sub(r"^[a-zA-Z0-9+.-]+://", "", raw_url)
+                # Drop any path/query portion just in case
+                raw_url_noscheme = raw_url_noscheme.split("/", 1)[0]
+
+                host = raw_url_noscheme
+                port = None
+                if ":" in raw_url_noscheme:
+                    host, port_s = raw_url_noscheme.rsplit(":", 1)
+                    try:
+                        port = int(port_s)
+                    except Exception:
+                        port = None
+
+                info["stratumURL"] = host or None
+                info["stratumPort"] = port
+                info["stratumUser"] = (chosen.get("user") or None)
+
+            # Also include all pools for richer UI/debugging
+            info["pools"] = [
+                {
+                    "url": p.get("url"),
+                    "user": p.get("user"),
+                    "enabled": bool(p.get("enabled")),
+                    "alive": bool(p.get("alive")),
+                    "active": bool(p.get("active")),
+                    "uid": p.get("uid"),
+                }
+                for g in groups
+                for p in (g.get("pools") or [])
+            ] or None
+        info["_raw_grpc_pools"] = pools
+    except Exception:
+        pass
+
+    # ----- Details / Status (uptime, hostname, version, found blocks) -----
+    for method in ("braiins.bos.v1.MinerService/GetMinerStatus", "braiins.bos.v1.MinerService/GetMinerDetails"):
+        try:
+            resp = _run(method, {}, token=token)
+            info.setdefault("_raw_grpc_meta", {})[method.split("/")[-1]] = resp
+            # hostname
+            for k in ("hostname", "hostName", "name"):
+                v = resp.get(k) if isinstance(resp, dict) else None
+                if isinstance(v, str) and v:
+                    info["hostname"] = v
+                    break
+            # version
+            for k in ("version", "firmwareVersion", "bosVersion", "softwareVersion"):
+                v = resp.get(k) if isinstance(resp, dict) else None
+                if isinstance(v, str) and v:
+                    info["version"] = v
+                    break
+            # uptime
+            # Braiins gRPC GetMinerDetails returns several uptime fields; normalize to "uptimeSeconds"
+            for k in ("uptimeSeconds", "uptimeS", "bosminerUptimeS", "systemUptimeS", "systemUptime"):
+                if k in details and details.get(k) is not None:
+                    try:
+                        info["uptimeSeconds"] = float(details.get(k))
+                    except Exception:
+                        pass
+                    break
+            # found blocks
+            for k in ("foundBlocks", "found_blocks", "blocksFound", "blocks_found"):
+                v = resp.get(k) if isinstance(resp, dict) else None
+                if v is not None:
+                    try:
+                        info["foundBlocks"] = int(float(v))
+                    except Exception:
+                        info["foundBlocks"] = v
+                    break
+        except Exception:
+            continue
+
+    return True, info, None
+
+
 def _merge_braiins_cfg(device_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge global settings defaults with per-device overrides."""
     cfg: Dict[str, Any] = dict(DEFAULT_DEVICE_CFG.get("braiins", {}))
