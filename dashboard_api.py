@@ -1260,17 +1260,44 @@ def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, r
             buf += chunk
             if len(buf) > 2_000_000:
                 break
-    txt = buf.decode("utf-8", errors="replace").strip()
-    # sometimes there may be extra lines; try last JSON object
-    candidates = [t for t in txt.splitlines() if t.strip()]
-    if not candidates:
+
+    raw = buf.decode("utf-8", errors="replace")
+    # BOSminer/Braiins PAPI (cgminer-style) responses often contain NULs (\x00) and may contain
+    # multiple JSON blobs concatenated. json.loads() will throw "Extra data" in those cases.
+    raw = raw.replace("\x00", "").strip()
+    if not raw:
         raise RuntimeError("Empty response")
-    last = candidates[-1]
-    try:
-        data = json.loads(last)
-    except Exception:
-        # fallback to entire buffer
-        data = json.loads(txt)
+
+    dec = json.JSONDecoder()
+    data = None
+
+    # Prefer parsing from the last '{' (most likely the start of the last full JSON object).
+    brace_positions = [m.start() for m in re.finditer(r"\{", raw)]
+    # Limit work on pathological responses
+    for pos in reversed(brace_positions[-50:]):
+        try:
+            obj, end = dec.raw_decode(raw[pos:])
+            if isinstance(obj, dict):
+                data = obj
+                break
+        except Exception:
+            continue
+
+    if data is None:
+        # Fallback: try line-by-line (some firmwares send JSON + newline)
+        for line in reversed([ln.strip() for ln in raw.splitlines() if ln.strip()]):
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    data = obj
+                    break
+            except Exception:
+                continue
+
+    if data is None:
+        # Final fallback: try full buffer (may still raise)
+        data = json.loads(raw)
+
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected response type")
     return data
@@ -1762,17 +1789,18 @@ def api_add_device(payload: DeviceCreate):
         conn.close()
         raise HTTPException(status_code=409, detail="Device already exists")
 
-    if poll_type_final == "auto":
-        # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
-        # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
-        try:
-            ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
-            if ok_a:
-                cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
-                conn.commit()
-                poll_type_final = "avalon_cgminer"
-        except Exception:
-            pass
+    poll_type_final = "auto"
+
+    # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
+    # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
+    try:
+        ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
+        if ok_a:
+            cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
+            conn.commit()
+            poll_type_final = "avalon_cgminer"
+    except Exception:
+        pass
 
     device_id = cur.lastrowid
     conn.close()
