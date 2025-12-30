@@ -1043,6 +1043,161 @@ def _braiins_grpc_login(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple
     except Exception as e:
         return False, None, str(e)
 
+def _poll_braiins_grpc_extras(ip: str, port: int, token: str, timeout_s: float) -> Dict[str, Any]:
+    """Fetch extra metrics via Braiins gRPC.
+
+    We keep this optional and best-effort so that the main stats poll (MinerService/GetMinerStats)
+    continues to work even if a device/firmware doesn't expose some endpoints.
+
+    Returns a dict that may contain: temp, boardTemp, fanspeed, fanrpm.
+    """
+
+    out: Dict[str, Any] = {}
+
+    def _grpc_call_json(method: str, payload_json: str) -> Optional[Dict[str, Any]]:
+        cmd = [
+            "grpcurl",
+            "-plaintext",
+            "-d",
+            payload_json,
+        ]
+        # Braiins gRPC auth header appears to accept both raw token and Bearer token.
+        if token:
+            cmd += ["-H", f"authorization: {token}"]
+        cmd += [f"{ip}:{port}", method]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(0.5, float(timeout_s)),
+            )
+        except Exception as e:
+            logger.debug("[braiins_grpc] extras grpcurl failed: %s", e)
+            return None
+
+        if proc.returncode != 0:
+            # Some devices want Bearer prefix. Try once more.
+            if token and "Bearer" not in (proc.stderr or ""):
+                cmd2 = [
+                    "grpcurl",
+                    "-plaintext",
+                    "-H",
+                    f"authorization: Bearer {token}",
+                    "-d",
+                    payload_json,
+                    f"{ip}:{port}",
+                    method,
+                ]
+                try:
+                    proc2 = subprocess.run(
+                        cmd2,
+                        capture_output=True,
+                        text=True,
+                        timeout=max(0.5, float(timeout_s)),
+                    )
+                    if proc2.returncode == 0:
+                        proc = proc2
+                    else:
+                        logger.debug("[braiins_grpc] extras grpcurl nonzero: %s", (proc2.stderr or proc2.stdout or "").strip())
+                        return None
+                except Exception as e:
+                    logger.debug("[braiins_grpc] extras grpcurl retry failed: %s", e)
+                    return None
+            else:
+                logger.debug("[braiins_grpc] extras grpcurl nonzero: %s", (proc.stderr or proc.stdout or "").strip())
+                return None
+
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            # grpcurl should emit a single JSON object, but guard anyway.
+            try:
+                first_line = raw.splitlines()[0]
+                return json.loads(first_line)
+            except Exception:
+                logger.debug("[braiins_grpc] extras JSON parse failed (first 200): %r", raw[:200])
+                return None
+
+    # CoolingService exposes temps and fan states.
+    cooling = _grpc_call_json("braiins.bos.v1.CoolingService/GetCoolingState", "{}")
+    if isinstance(cooling, dict):
+        # temp / boardTemp
+        chip_temp = None
+        board_temp = None
+
+        ht = cooling.get("highestTemperature")
+        if isinstance(ht, dict):
+            t = ht.get("temperature")
+            if isinstance(t, dict) and "degreeC" in t:
+                try:
+                    chip_temp = float(t.get("degreeC"))
+                except Exception:
+                    pass
+
+        # Some firmwares may return a list of temperatures (schema varies).
+        temps = cooling.get("temperatures")
+        if isinstance(temps, list):
+            for item in temps:
+                if not isinstance(item, dict):
+                    continue
+                loc = str(item.get("location") or "")
+                t = item.get("temperature")
+                deg = None
+                if isinstance(t, dict) and "degreeC" in t:
+                    try:
+                        deg = float(t.get("degreeC"))
+                    except Exception:
+                        deg = None
+                if deg is None and "degreeC" in item:
+                    try:
+                        deg = float(item.get("degreeC"))
+                    except Exception:
+                        deg = None
+
+                if deg is None:
+                    continue
+                if "CHIP" in loc and (chip_temp is None or deg > chip_temp):
+                    chip_temp = deg
+                if "BOARD" in loc and (board_temp is None or deg > board_temp):
+                    board_temp = deg
+
+        if chip_temp is not None:
+            out["temp"] = chip_temp
+        if board_temp is not None:
+            out["boardTemp"] = board_temp
+
+        # fans
+        fans = cooling.get("fans")
+        if isinstance(fans, list) and fans:
+            rpms = []
+            ratios = []
+            for f in fans:
+                if not isinstance(f, dict):
+                    continue
+                if "rpm" in f:
+                    try:
+                        rpms.append(float(f.get("rpm")))
+                    except Exception:
+                        pass
+                if "targetSpeedRatio" in f:
+                    try:
+                        ratios.append(float(f.get("targetSpeedRatio")))
+                    except Exception:
+                        pass
+
+            if rpms:
+                out["fanrpm"] = sum(rpms) / len(rpms)
+            if ratios:
+                # represent as percentage like the BOSminer path does (0..100)
+                out["fanspeed"] = max(ratios) * 100.0
+
+    return out
+
 
 def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     """Poll Braiins OS gRPC MinerService/GetMinerStats for rich metrics."""
