@@ -1762,18 +1762,17 @@ def api_add_device(payload: DeviceCreate):
         conn.close()
         raise HTTPException(status_code=409, detail="Device already exists")
 
-    poll_type_final = "auto"
-
-    # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
-    # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
-    try:
-        ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
-        if ok_a:
-            cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
-            conn.commit()
-            poll_type_final = "avalon_cgminer"
-    except Exception:
-        pass
+    if poll_type_final == "auto":
+        # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
+        # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
+        try:
+            ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
+            if ok_a:
+                cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
+                conn.commit()
+                poll_type_final = "avalon_cgminer"
+        except Exception:
+            pass
 
     device_id = cur.lastrowid
     conn.close()
