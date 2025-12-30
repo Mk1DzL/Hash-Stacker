@@ -1761,7 +1761,10 @@ def api_add_device(payload: DeviceCreate):
     if poll_type_final == "auto" and (payload.grpc_username or payload.grpc_password):
         poll_type_final = "braiins_grpc"
 
+
     cfg: Dict[str, Any] = {}
+
+    # Start with explicit (top-level) fields.
     if payload.grpc_username:
         cfg["grpc_username"] = payload.grpc_username
     if payload.grpc_password:
@@ -1770,9 +1773,50 @@ def api_add_device(payload: DeviceCreate):
         cfg["grpc_port"] = int(payload.grpc_port)
     if payload.papi_port:
         cfg["papi_port"] = int(payload.papi_port)
-    # Preserve any extra fields sent by clients (bounded)
-    for k, v in getattr(payload, "__dict__", {}).items():
-        if k in ("ip", "name", "poll_type", "grpc_username", "grpc_password", "grpc_port", "papi_port"):
+
+    # Pydantic v2 stores extra fields in model_dump(); v1 uses dict().
+    try:
+        dumped = payload.model_dump(exclude_none=True)  # type: ignore[attr-defined]
+    except Exception:
+        dumped = payload.dict(exclude_none=True)  # type: ignore[attr-defined]
+
+    # The Web UI currently posts creds under:
+    #   config: { braiins: { rest_username, rest_password, (optional) grpc_port } }
+    # Accept that schema and map it onto our gRPC fields.
+    braiins_cfg = None
+    cfg_obj = dumped.get("config")
+    if isinstance(cfg_obj, dict):
+        braiins_cfg = cfg_obj.get("braiins")
+
+    if isinstance(braiins_cfg, dict):
+        ui_user = braiins_cfg.get("grpc_username") or braiins_cfg.get("rest_username") or braiins_cfg.get("username")
+        ui_pass = braiins_cfg.get("grpc_password") or braiins_cfg.get("rest_password") or braiins_cfg.get("password")
+        ui_port = braiins_cfg.get("grpc_port") or braiins_cfg.get("port")
+
+        if ui_user and not cfg.get("grpc_username"):
+            cfg["grpc_username"] = str(ui_user)
+        if ui_pass and not cfg.get("grpc_password"):
+            cfg["grpc_password"] = str(ui_pass)
+        if ui_port and not cfg.get("grpc_port"):
+            try:
+                cfg["grpc_port"] = int(ui_port)
+            except Exception:
+                pass
+
+        # If creds exist and poll_type was left as auto, prefer braiins_grpc.
+        if poll_type_final == "auto" and (ui_user or ui_pass):
+            poll_type_final = "braiins_grpc"
+
+    # Also accept legacy extras posted at the top-level.
+    if dumped.get("rest_username") and not cfg.get("grpc_username"):
+        cfg["grpc_username"] = str(dumped.get("rest_username"))
+    if dumped.get("rest_password") and not cfg.get("grpc_password"):
+        cfg["grpc_password"] = str(dumped.get("rest_password"))
+
+    # Preserve any other extra fields sent by clients (bounded).
+    reserved = {"ip","name","poll_type","grpc_username","grpc_password","grpc_port","papi_port","rest_username","rest_password"}
+    for k, v in (dumped or {}).items():
+        if k in reserved:
             continue
         if v is None:
             continue
@@ -1783,6 +1827,7 @@ def api_add_device(payload: DeviceCreate):
                 continue
             if len(s) <= 4096:
                 cfg[k] = v
+
     config_json = json.dumps(cfg) if cfg else None
     try:
         cur.execute(
