@@ -975,7 +975,7 @@ def _probe_braiins_grpc(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
             ["grpcurl", "-plaintext", f"{ip}:{port}", "list"],
             capture_output=True,
             text=True,
-            timeout=max(float(timeout_s or 1.2), 3.5),
+            timeout=max(float(timeout_s or 1.2), 2.0),
         )
         if cp.returncode != 0:
             return False, None, (cp.stderr or cp.stdout or "grpcurl failed").strip()
@@ -1261,44 +1261,17 @@ def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, r
             buf += chunk
             if len(buf) > 2_000_000:
                 break
-
-    raw = buf.decode("utf-8", errors="replace")
-    # BOSminer/Braiins PAPI (cgminer-style) responses often contain NULs (\x00) and may contain
-    # multiple JSON blobs concatenated. json.loads() will throw "Extra data" in those cases.
-    raw = raw.replace("\x00", "").strip()
-    if not raw:
+    txt = buf.decode("utf-8", errors="replace").strip()
+    # sometimes there may be extra lines; try last JSON object
+    candidates = [t for t in txt.splitlines() if t.strip()]
+    if not candidates:
         raise RuntimeError("Empty response")
-
-    dec = json.JSONDecoder()
-    data = None
-
-    # Prefer parsing from the last '{' (most likely the start of the last full JSON object).
-    brace_positions = [m.start() for m in re.finditer(r"\{", raw)]
-    # Limit work on pathological responses
-    for pos in reversed(brace_positions[-50:]):
-        try:
-            obj, end = dec.raw_decode(raw[pos:])
-            if isinstance(obj, dict):
-                data = obj
-                break
-        except Exception:
-            continue
-
-    if data is None:
-        # Fallback: try line-by-line (some firmwares send JSON + newline)
-        for line in reversed([ln.strip() for ln in raw.splitlines() if ln.strip()]):
-            try:
-                obj = _parse_first_json(line) or json.loads(line)
-                if isinstance(obj, dict):
-                    data = obj
-                    break
-            except Exception:
-                continue
-
-    if data is None:
-        # Final fallback: try full buffer (may still raise)
-        data = json.loads(raw)
-
+    last = candidates[-1]
+    try:
+        data = json.loads(last)
+    except Exception:
+        # fallback to entire buffer
+        data = json.loads(txt)
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected response type")
     return data
@@ -1754,6 +1727,11 @@ def api_add_device(payload: DeviceCreate):
     poll_type_final = (payload.poll_type or "auto").strip().lower()
     if poll_type_final not in ("auto", "http", "avalon_cgminer", "bosminer_papi", "braiins_grpc"):
         poll_type_final = "auto"
+    # If user provided Braiins gRPC credentials but left poll_type as auto,
+    # prefer Braiins gRPC (it will still fall back to BOSminer PAPI inside the poller if needed).
+    if poll_type_final == "auto" and (payload.grpc_username or payload.grpc_password):
+        poll_type_final = "braiins_grpc"
+
     cfg: Dict[str, Any] = {}
     if payload.grpc_username:
         cfg["grpc_username"] = payload.grpc_username
@@ -1790,8 +1768,6 @@ def api_add_device(payload: DeviceCreate):
         conn.close()
         raise HTTPException(status_code=409, detail="Device already exists")
 
-    poll_type_final = "auto"
-
     # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
     # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
     try:
@@ -1802,6 +1778,24 @@ def api_add_device(payload: DeviceCreate):
             poll_type_final = "avalon_cgminer"
     except Exception:
         pass
+
+    # Quick protocol hint for Braiins OS: if gRPC responds, set it immediately.
+    if poll_type_final == "auto":
+        try:
+            cfg_hint = {}
+            if payload.grpc_username:
+                cfg_hint["grpc_username"] = payload.grpc_username
+            if payload.grpc_password:
+                cfg_hint["grpc_password"] = payload.grpc_password
+            if payload.grpc_port:
+                cfg_hint["grpc_port"] = payload.grpc_port
+            ok_g, _meta, _errg = _probe_braiins_grpc(ip, 0.5, _merge_braiins_cfg(cfg_hint))
+            if ok_g:
+                cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("braiins_grpc", ip))
+                conn.commit()
+                poll_type_final = "braiins_grpc"
+        except Exception:
+            pass
 
     device_id = cur.lastrowid
     conn.close()
