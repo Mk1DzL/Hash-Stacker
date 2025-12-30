@@ -1136,6 +1136,23 @@ def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[
             "lastDifficulty": to_f(lastdiff),
             "lastShareTime": lastshare,
             "last_seen": int(time.time()),
+            "hashrate": to_f(g5s),
+            "hashrate_1m": to_f(g1m),
+            "hashrate_5m": to_f(g5m),
+            "hashrate_15m": to_f(g15m),
+            "hashrate_24h": to_f(g24h),
+            "hashrate_avg": to_f(gavg),
+            "hashrate_ths": ghs_to_ths(g5s),
+            "sharesAccepted": to_f(acc),
+            "sharesRejected": to_f(rej),
+            "bestDiff": to_f(best),
+            "efficiency": to_f(jth),
+            "temp": None,
+            "boardTemp": None,
+            "fanspeed": None,
+            "fanrpm": None,
+            "hostname": None,
+            "version": None,
             "_raw_grpc": stats,
         }
         return True, info, None
@@ -1784,18 +1801,10 @@ def api_add_device(payload: DeviceCreate):
     #   config: { braiins: { rest_username, rest_password, (optional) grpc_port } }
     # Accept that schema and map it onto our gRPC fields.
     braiins_cfg = None
-    # Prefer extras (Pydantic v2 stores unknown keys here) because some clients/UI payloads
-    # may not include extra fields in model_dump() depending on config.
-    cfg_obj = None
-    try:
-        if getattr(payload, "model_extra", None) and isinstance(payload.model_extra, dict):
-            cfg_obj = payload.model_extra.get("config")
-    except Exception:
-        cfg_obj = None
-    if cfg_obj is None:
-        cfg_obj = dumped.get("config")
+    cfg_obj = dumped.get("config")
     if isinstance(cfg_obj, dict):
         braiins_cfg = cfg_obj.get("braiins")
+
     if isinstance(braiins_cfg, dict):
         ui_user = braiins_cfg.get("grpc_username") or braiins_cfg.get("rest_username") or braiins_cfg.get("username")
         ui_pass = braiins_cfg.get("grpc_password") or braiins_cfg.get("rest_password") or braiins_cfg.get("password")
