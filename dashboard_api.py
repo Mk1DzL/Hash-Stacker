@@ -1155,6 +1155,16 @@ def _poll_braiins_grpc(ip: str, timeout_s: float, cfg: Dict[str, Any]) -> Tuple[
             "version": None,
             "_raw_grpc": stats,
         }
+        # Optional richer metrics (temps/fans/hostname/version) via extra gRPC calls.
+        try:
+            extra = _poll_braiins_grpc_extras(ip, port, token, timeout_s)
+            for k, v in extra.items():
+                if v is None:
+                    continue
+                info[k] = v
+        except Exception:
+            pass
+
         return True, info, None
     except Exception as e:
         return False, None, str(e)
