@@ -18,6 +18,7 @@ DEFAULT_DEVICE_CFG: Dict[str, Dict[str, Any]] = {
 from fastapi import APIRouter, HTTPException, UploadFile, File, Body, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from pydantic import ConfigDict, AliasChoices
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 import time
@@ -30,6 +31,7 @@ import sqlite3
 import re
 import socket
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -401,12 +403,58 @@ def _save_settings(settings: Dict[str, Any]) -> None:
     conn.close()
 
 
+
 class DeviceCreate(BaseModel):
+    """Payload for creating a device from the dashboard UI or API.
+
+    The dashboard UI historically used camelCase field names; we accept both snake_case and
+    camelCase to avoid silently dropping credentials (which caused devices to fall back to
+    auto/BOSminer probes and appear offline).
+    """
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
     ip: str = Field(..., description="IPv4/IPv6 address")
     name: Optional[str] = None
 
+    # Polling / protocol selection
+    poll_type: Optional[str] = Field(
+        default="auto",
+        validation_alias=AliasChoices("poll_type", "pollType"),
+        description="Polling protocol. Supported: auto, http, avalon_cgminer, bosminer_papi, braiins_grpc",
+    )
+
+    # Braiins OS gRPC auth (BOS+ / BOS)
+    grpc_username: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("grpc_username", "grpcUsername", "username", "user"),
+        description="Braiins OS gRPC username (e.g., root)",
+    )
+    grpc_password: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("grpc_password", "grpcPassword", "password", "pass"),
+        description="Braiins OS gRPC password",
+    )
+
+    # Optional ports (advanced)
+    grpc_port: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("grpc_port", "grpcPort"),
+        ge=1,
+        le=65535,
+        description="gRPC port (default 50051)",
+    )
+    papi_port: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("papi_port", "papiPort"),
+        ge=1,
+        le=65535,
+        description="BOSminer PAPI port (default 4028)",
+    )
+
 
 class SettingsUpdate(BaseModel):
+
     settings: Dict[str, Any]
 
 
@@ -1302,9 +1350,9 @@ def _probe_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]
 def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
     port = int((cfg or {}).get("papi_port") or 4028)
     try:
-        summary = _bosminer_query(ip, "summary", t, port=port, req_id=1)
-        temps = _bosminer_query(ip, "temps", t, port=port, req_id=2)
-        fans = _bosminer_query(ip, "fans", t, port=port, req_id=3)
+        summary = _bosminer_query(ip, "summary", timeout_s, port=port, req_id=1)
+        temps = _bosminer_query(ip, "temps", timeout_s, port=port, req_id=2)
+        fans = _bosminer_query(ip, "fans", timeout_s, port=port, req_id=3)
 
         # summary parsing (BOSminer tends to mirror cgminer-ish keys)
         srow = None
@@ -1326,7 +1374,7 @@ def _poll_bosminer_papi(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
         if power is None:
             # some firmwares expose power under STATS/DEVS; try a quick fallback
             try:
-                stats = _bosminer_query(ip, "stats", t, port=port, req_id=4)
+                stats = _bosminer_query(ip, "stats", timeout_s, port=port, req_id=4)
                 power = _first_number(stats, ["power", "watts", "power_w"])
             except Exception:
                 power = None
@@ -1697,94 +1745,84 @@ def api_list_devices():
 
 @router.post("/devices")
 def api_add_device(payload: DeviceCreate):
-    """
-    Add a device to the dashboard.
-
-    Important compatibility notes:
-      - Older/newer dashboard UIs may send credentials as username/password
-        (instead of grpc_username/grpc_password). We normalize these.
-      - We persist per-device overrides in dashboard_devices.config_json.
-    """
     ip = _validate_ip(payload.ip)
-
-    # --- normalize incoming fields (UI/backwards compatible) ---
-    def _get_any(obj, names):
-        for n in names:
-            try:
-                v = getattr(obj, n)
-            except Exception:
-                v = None
-            if v is not None and str(v).strip() != "":
-                return v
-        return None
-
-    poll_type_req = _get_any(payload, ["poll_type", "pollType", "type"]) or "auto"
-    poll_type_req = str(poll_type_req).strip().lower() or "auto"
-
-    grpc_user = _get_any(payload, ["grpc_username", "grpcUsername", "username", "user", "login"])
-    grpc_pass = _get_any(payload, ["grpc_password", "grpcPassword", "password", "pass", "passwd", "pwd"])
-    grpc_port = _get_any(payload, ["grpc_port", "grpcPort"])
-    papi_port = _get_any(payload, ["papi_port", "papiPort"])
-
-    # Build per-device cfg (only store keys that were provided)
-    cfg: Dict[str, Any] = {}
-    if grpc_user is not None:
-        cfg["grpc_username"] = str(grpc_user)
-    if grpc_pass is not None:
-        cfg["grpc_password"] = str(grpc_pass)
-    if grpc_port is not None:
-        try:
-            cfg["grpc_port"] = int(grpc_port)
-        except Exception:
-            pass
-    if papi_port is not None:
-        try:
-            cfg["papi_port"] = int(papi_port)
-        except Exception:
-            pass
-
     conn = db._get_conn()
     cur = conn.cursor()
     now = _utcnow_iso()
-
+    # put at end
     cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM dashboard_devices;")
     next_order = int(cur.fetchone()["next_order"])
+    # normalize poll_type + pack protocol config
+    poll_type_final = (payload.poll_type or "auto").strip().lower()
+    if poll_type_final not in ("auto", "http", "avalon_cgminer", "bosminer_papi", "braiins_grpc"):
+        poll_type_final = "auto"
+    # If user provided Braiins gRPC credentials but left poll_type as auto,
+    # prefer Braiins gRPC (it will still fall back to BOSminer PAPI inside the poller if needed).
+    if poll_type_final == "auto" and (payload.grpc_username or payload.grpc_password):
+        poll_type_final = "braiins_grpc"
 
+    cfg: Dict[str, Any] = {}
+    if payload.grpc_username:
+        cfg["grpc_username"] = payload.grpc_username
+    if payload.grpc_password:
+        cfg["grpc_password"] = payload.grpc_password
+    if payload.grpc_port:
+        cfg["grpc_port"] = int(payload.grpc_port)
+    if payload.papi_port:
+        cfg["papi_port"] = int(payload.papi_port)
+    # Preserve any extra fields sent by clients (bounded)
+    for k, v in getattr(payload, "__dict__", {}).items():
+        if k in ("ip", "name", "poll_type", "grpc_username", "grpc_password", "grpc_port", "papi_port"):
+            continue
+        if v is None:
+            continue
+        if isinstance(v, (str, int, float, bool, dict, list)):
+            try:
+                s = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+            except Exception:
+                continue
+            if len(s) <= 4096:
+                cfg[k] = v
+    config_json = json.dumps(cfg) if cfg else None
     try:
         cur.execute(
             """
             INSERT INTO dashboard_devices (name, ip, created_at, sort_order, poll_type, config_json)
             VALUES (?, ?, ?, ?, ?, ?);
             """,
-            (payload.name, ip, now, next_order, poll_type_req, json.dumps(cfg) if cfg else None),
+            (payload.name, ip, now, next_order, poll_type_final, config_json),
         )
         conn.commit()
     except sqlite3.IntegrityError:  # type: ignore[name-defined]
         conn.close()
         raise HTTPException(status_code=409, detail="Device already exists")
 
-    poll_type_final = poll_type_req
+    # Quick protocol hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
+    # This avoids the first dashboard refresh doing an HTTP timeout before discovering it.
+    try:
+        ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
+        if ok_a:
+            cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
+            conn.commit()
+            poll_type_final = "avalon_cgminer"
+    except Exception:
+        pass
 
-    # If poll_type was auto, do fast protocol hints (no metrics yet) to avoid the UI
-    # briefly showing "offline" due to trying the wrong protocol first.
+    # Quick protocol hint for Braiins OS: if gRPC responds, set it immediately.
     if poll_type_final == "auto":
-        # Braiins gRPC hint: if gRPC responds (even w/out auth), use it.
         try:
-            ok_g, _meta, _errg = _probe_braiins_grpc(ip, 0.5, _merge_braiins_cfg(cfg))
+            cfg_hint = {}
+            if payload.grpc_username:
+                cfg_hint["grpc_username"] = payload.grpc_username
+            if payload.grpc_password:
+                cfg_hint["grpc_password"] = payload.grpc_password
+            if payload.grpc_port:
+                cfg_hint["grpc_port"] = payload.grpc_port
+            ok_g, _meta, _errg = _probe_braiins_grpc(ip, 0.5, _merge_braiins_cfg(cfg_hint))
             if ok_g:
                 cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("braiins_grpc", ip))
                 conn.commit()
                 poll_type_final = "braiins_grpc"
-        except Exception:
-            pass
-
-        # Avalon hint: if cgminer TCP/4028 answers, it's very likely an Avalon Q.
-        try:
-            ok_a, _ver, _err = _probe_avalon_q(ip, 0.35)
-            if ok_a:
-                cur.execute("UPDATE dashboard_devices SET poll_type=? WHERE ip=?;", ("avalon_cgminer", ip))
-                conn.commit()
-                poll_type_final = "avalon_cgminer"
         except Exception:
             pass
 
@@ -1794,6 +1832,8 @@ def api_add_device(payload: DeviceCreate):
         "status": "ok",
         "device": {"id": device_id, "ip": ip, "name": payload.name, "sort_order": next_order, "poll_type": poll_type_final},
     }
+
+
 
 
 @router.delete("/devices/{device_id}")
