@@ -30,6 +30,7 @@ import sqlite3
 import re
 import socket
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -974,7 +975,7 @@ def _probe_braiins_grpc(ip: str, timeout_s: float, cfg: Optional[Dict[str, Any]]
             ["grpcurl", "-plaintext", f"{ip}:{port}", "list"],
             capture_output=True,
             text=True,
-            timeout=max(float(timeout_s or 1.2), 2.0),
+            timeout=max(float(timeout_s or 1.2), 3.5),
         )
         if cp.returncode != 0:
             return False, None, (cp.stderr or cp.stdout or "grpcurl failed").strip()
@@ -1287,7 +1288,7 @@ def _bosminer_query(ip: str, command: str, timeout_s: float, port: int = 4028, r
         # Fallback: try line-by-line (some firmwares send JSON + newline)
         for line in reversed([ln.strip() for ln in raw.splitlines() if ln.strip()]):
             try:
-                obj = json.loads(line)
+                obj = _parse_first_json(line) or json.loads(line)
                 if isinstance(obj, dict):
                     data = obj
                     break
