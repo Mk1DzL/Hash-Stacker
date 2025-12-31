@@ -1220,12 +1220,12 @@
 
       <div class="row">
         <div>
-          <label>Play sound on share</label>
-          <select id="soundEnabled">
+          <label>Play sound on accepted share</label>
+          <select id="soundOnAccepted">
             <option value="0">Off</option>
             <option value="1">On</option>
           </select>
-          <div class="hint">Requires selecting an “active” sound in the Sound tab.</div>
+          <div class="hint">Pick a “Valid” sound in the Sound tab (or keep the legacy “Active” sound).</div>
         </div>
         <div>
           <label for="soundVol">Volume</label>
@@ -1412,7 +1412,8 @@ const $ = (id) => document.getElementById(id);
   const shakeDuration = $("shakeDuration");
   const shakeDurationLabel = $("shakeDurationLabel");
   const coinEnabled = $("coinEnabled");
-  const soundEnabled = $("soundEnabled");
+  const soundOnAccepted = $("soundOnAccepted");
+  const soundOnRejected = $("soundOnRejected");
   const soundVol = $("soundVol");
   const soundVolLabel = $("soundVolLabel");
   const soundPitchJitter = $("soundPitchJitter");
@@ -1453,6 +1454,14 @@ const $ = (id) => document.getElementById(id);
   let deviceState = new Map(); // id -> { lastSharesAccepted, lastSeenMs, lastInfo }
   let pollTimer = null;
   let pollInFlight = false;
+  // Sound routing
+  let soundAssetsCache = [];
+  let validSoundUrl = null;
+  let invalidSoundUrl = null;
+  let validSoundEl = null;
+  let invalidSoundEl = null;
+
+  // Legacy (single “active sound”) support
   let activeSoundUrl = null;
   let activeSoundEl = null;
   let coinCount = 0;
@@ -2166,7 +2175,11 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
       if (coinPopLabel) coinPopLabel.textContent = `${fmtInt(clamped)} px/s`;
     }
 
-    soundEnabled.value = anim.sound_on_share ? "1" : "0";
+    if (soundOnAccepted) soundOnAccepted.value = ((anim.sound_on_accepted != null) ? anim.sound_on_accepted : anim.sound_on_share) ? "1" : "0";
+    if (soundOnRejected){
+      const defRej = (anim.sound_on_rejected != null) ? anim.sound_on_rejected : true;
+      soundOnRejected.value = defRej ? "1" : "0";
+    }
     soundVol.value = anim.sound_volume ?? 0.35;
     if (soundPitchJitter){
       soundPitchJitter.value = anim.sound_pitch_jitter ?? 0;
@@ -2211,7 +2224,10 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
         coin_physics: (String(coinPhysics?.value) === "1"),
         coin_pop_strength: Number(coinPop?.value ?? 520),
 
-        sound_on_share: String(soundEnabled.value) === "1",
+        sound_on_accepted: (soundOnAccepted ? (String(soundOnAccepted.value) === "1") : (String("0") === "1")),
+        sound_on_rejected: (soundOnRejected ? (String(soundOnRejected.value) === "1") : false),
+        // Back-compat for older backends / pages
+        sound_on_share: (soundOnAccepted ? (String(soundOnAccepted.value) === "1") : false),
         sound_volume: Number(soundVol.value || 0),
         sound_pitch_jitter: Number(soundPitchJitter?.value || 0),
         max_coins: Number(maxCoins.value || 35),
@@ -2971,7 +2987,10 @@ async function loadDevices(){
     const data = await apiJson(`${apiBase}/api/dashboard/assets?kind=sound`);
     const assets = data.assets || [];
     const active = data.active_id;
+    soundAssetsCache = assets;
     renderAssetList(sndList, assets, active, "sound");
+
+    // Legacy single-active sound (kept for back-compat)
     activeSoundUrl = active ? `${apiBase}/api/dashboard/assets/${active}/file` : null;
     if (activeSoundUrl){
       activeSoundEl = new Audio(activeSoundUrl);
@@ -2979,10 +2998,33 @@ async function loadDevices(){
     }else{
       activeSoundEl = null;
     }
+
+    // New routing: accepted vs rejected
+    const anim = settings?.animations || {};
+    const validId = Number(anim.sound_valid_asset_id || 0) || active || 0;
+    const invalidId = Number(anim.sound_invalid_asset_id || 0) || 0;
+
+    validSoundUrl = validId ? `${apiBase}/api/dashboard/assets/${validId}/file` : activeSoundUrl;
+    if (validSoundUrl){
+      validSoundEl = new Audio(validSoundUrl);
+      validSoundEl.volume = Number(anim.sound_volume ?? 0.35);
+    }else{
+      validSoundEl = null;
+    }
+
+    // Default invalid sound: builtin Metalocalypse clip
+    const builtinInvalid = `${apiBase}/builtin_assets/sounds/metalocalypse.mp3`;
+    invalidSoundUrl = invalidId ? `${apiBase}/api/dashboard/assets/${invalidId}/file` : builtinInvalid;
+    invalidSoundEl = new Audio(invalidSoundUrl);
+    invalidSoundEl.volume = Number(anim.sound_volume ?? 0.35);
   }
 
   function renderAssetList(container, assets, activeId, kind){
     const isBg = (kind === "background");
+    const anim = settings?.animations || {};
+    const validSel = Number(anim.sound_valid_asset_id || 0) || 0;
+    const invalidSel = Number(anim.sound_invalid_asset_id || 0) || 0;
+
     container.innerHTML = assets.map(a => {
       const url = `${apiBase}/api/dashboard/assets/${a.id}/file`;
       const active = (a.id === activeId);
@@ -2995,17 +3037,27 @@ async function loadDevices(){
         : `<div class="mono" style="font-size:1.4rem; color:var(--muted);">♪</div>`;
 
       const title = a.orig_name || a.filename || `asset ${a.id}`;
+      const badges =
+        `${active ? "<span class='badge active'>active</span>" : ""}` +
+        `${(kind==="sound" && a.id===validSel) ? "<span class='badge' style='margin-left:6px;'>valid</span>" : ""}` +
+        `${(kind==="sound" && a.id===invalidSel) ? "<span class='badge danger' style='margin-left:6px;'>invalid</span>" : ""}`;
+
       return `
         <div class="asset">
           <div class="thumb">${thumb}</div>
           <div class="meta">
             <div><strong>${escapeHtml(title)}</strong></div>
             <div class="mono">${escapeHtml(mime || "")}</div>
-            <div>${a.size_bytes ? Math.round(a.size_bytes/1024) + " KB" : ""} ${active ? "• " : ""}${active ? "<span class='badge active'>active</span>" : ""}</div>
+            <div>${a.size_bytes ? Math.round(a.size_bytes/1024) + " KB" : ""} ${badges}</div>
           </div>
           <div class="actions">
             <button class="btn secondary" data-act="activate" data-kind="${kind}" data-id="${a.id}">Set active</button>
-            ${kind === "sound" ? `<button class="btn secondary" data-act="test" data-kind="sound" data-id="${a.id}">Test</button>` : ``}
+            ${kind === "sound" ? `
+              <button class="btn secondary" data-act="set-valid" data-id="${a.id}">Use for valid</button>
+              <button class="btn secondary" data-act="set-invalid" data-id="${a.id}">Use for invalid</button>
+              <button class="btn secondary" data-act="clear-invalid">Default invalid</button>
+              <button class="btn secondary" data-act="test" data-kind="sound" data-id="${a.id}">Test</button>
+            ` : ``}
             <button class="btn danger" data-act="delete" data-kind="${kind}" data-id="${a.id}">Delete</button>
           </div>
         </div>
@@ -3021,6 +3073,47 @@ async function loadDevices(){
         // Keep settings copy up to date
         const s = await apiJson(`${apiBase}/api/dashboard/settings`);
         settings = s.settings;
+      });
+    });
+
+    container.querySelectorAll("[data-act='set-valid']").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = Number(btn.getAttribute("data-id"));
+        settings.animations = settings.animations || {};
+        settings.animations.sound_valid_asset_id = id;
+        try{
+          await saveSettings({ animations: settings.animations });
+          await refreshSounds();
+        }catch(e){
+          alert("Failed to set valid sound: " + e.message);
+        }
+      });
+    });
+
+    container.querySelectorAll("[data-act='set-invalid']").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = Number(btn.getAttribute("data-id"));
+        settings.animations = settings.animations || {};
+        settings.animations.sound_invalid_asset_id = id;
+        try{
+          await saveSettings({ animations: settings.animations });
+          await refreshSounds();
+        }catch(e){
+          alert("Failed to set invalid sound: " + e.message);
+        }
+      });
+    });
+
+    container.querySelectorAll("[data-act='clear-invalid']").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        settings.animations = settings.animations || {};
+        delete settings.animations.sound_invalid_asset_id;
+        try{
+          await saveSettings({ animations: settings.animations });
+          await refreshSounds();
+        }catch(e){
+          alert("Failed to reset invalid sound: " + e.message);
+        }
       });
     });
 
@@ -3048,7 +3141,8 @@ async function loadDevices(){
         if (isFinite(jit) && jit > 0){
           a.playbackRate = 1 + ((Math.random() * 2) - 1) * Math.min(0.5, jit);
         }
-        a.play().catch(()=>{});});
+        a.play().catch(()=>{});
+      });
     });
   }
 
@@ -3247,12 +3341,18 @@ async function loadDevices(){
       }
     }
 
-    if (anim.sound_on_share && activeSoundEl){
+    const playAccepted = (anim.sound_on_accepted != null) ? !!anim.sound_on_accepted : !!anim.sound_on_share;
+    const playRejected = (anim.sound_on_rejected != null) ? !!anim.sound_on_rejected : true;
+    const isRejected = (kind === "rejected");
+    const shouldPlay = isRejected ? playRejected : playAccepted;
+    const srcEl = isRejected ? (invalidSoundEl || null) : (validSoundEl || activeSoundEl || null);
+
+    if (shouldPlay && srcEl){
       try{
-        activeSoundEl.volume = Number(anim.sound_volume ?? 0.35);
+        srcEl.volume = Number(anim.sound_volume ?? 0.35);
         // clone for overlapping plays
-        const a = activeSoundEl.cloneNode();
-        a.volume = activeSoundEl.volume;
+        const a = srcEl.cloneNode();
+        a.volume = srcEl.volume;
         // make playbackRate actually change pitch (some browsers preserve pitch by default)
         try{ a.preservesPitch = false; }catch(_){}
         try{ a.mozPreservesPitch = false; }catch(_){}
@@ -3676,4 +3776,13 @@ function updateCoinPhysicsConfig(){
 })();
 </script>
 </body>
-</html>
+</html>        <div>
+          <label>Play sound on rejected share</label>
+          <select id="soundOnRejected">
+            <option value="0">Off</option>
+            <option value="1">On</option>
+          </select>
+          <div class="hint">Defaults to builtin <span class="mono">builtin_assets/sounds/metalocalypse.mp3</span> unless you pick an “Invalid” sound in the Sound tab.</div>
+        </div>
+
+
