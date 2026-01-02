@@ -327,24 +327,25 @@ It discovers your device when given an IP address, applies a (hopefully) safe bu
 2. Run build.sh to create the docker container image
 
 ### Docker compose example:
-```version: "3.9"
+version: "3.8"
 
 services:
-  bitaxe-bench-web:
-    image: bitaxe-bench-web:latest
-    container_name: bitaxe-bench-web
+  bitaxe-webgui:
+    build: https://github.com/Mk1DzL/Hash-Stacker.git
+    container_name: hash-stacker
+    network_mode: host       # Host networking
     restart: unless-stopped
-    ports:
-      - "8000:8000"          # host:container (use whatever port you'd like)
-    volumes:
-      - bitaxe_bench_data:/app/data
     environment:
-      # optional, just explicit
-      - PYTHONUNBUFFERED=1
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8000             # Correct port
+    volumes:
+      - /data/bitaxe/dashboard.db:/app/dashboard.db
 
 volumes:
-  bitaxe_bench_data:
+  bitaxe_data:
     driver: local
+
 ```
 ## Configuration
 
