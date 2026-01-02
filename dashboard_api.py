@@ -428,7 +428,7 @@ class DeviceCreate(BaseModel):
         description="Polling protocol. Supported: auto, http, avalon_cgminer, bosminer_papi, braiins_grpc",
     )
 
-    # Braiins OS gRPC auth (BOS+ / BOS)
+    # Braiins OS gRPC auth (BOS+ / BOS) added by Mk1DzL 12/25
     grpc_username: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("grpc_username", "grpcUsername", "username", "user"),
