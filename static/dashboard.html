@@ -2328,7 +2328,7 @@ const bestDiff = info ? (info.bestDiff ?? info.best_diff ?? info.totalBestDiff) 
 
   function showTip(kind){
     if (!tipAddrBox) return;
-    const addr = (kind === "BTC") ? TIP_BTC : TIP_DOGE;
+    const addr = (kind === "BCH") ? TIP_BTC : TIP_DOGE;
     const nextShown = (tipShown === kind) ? "" : kind;
     tipShown = nextShown;
 
